@@ -45,10 +45,8 @@ log "Disk usage: $(df -h /workspace | tail -1)"
 # ─────────────────────────────────────────────
 log "--- Step 1: Installing dependencies ---"
 pip install -q torchaudio tqdm pillow awscli soundfile  # torch already in RunPod image — never reinstall
-apt-get update -q && apt-get install -y libsndfile1 --quiet  # torchaudio needs libsndfile for .flac (LibriSpeech)
 log "pip done"
-apt-get update -q
-apt-get install -y curl --quiet
+apt-get update -q && apt-get install -y libsndfile1 curl --quiet
 log "apt done"
 
 # Configure AWS if credentials are present
@@ -130,49 +128,9 @@ else
     fi
 
     if [ "$RESTORED" = "false" ]; then
-        log "No cache found — torchaudio will download LibriSpeech (~6GB, ~5-10min)..."
-        # torchaudio downloads on first use during training — we trigger it here
-        python3 -u -c "
-import torchaudio
-print('Downloading train-clean-100...', flush=True)
-torchaudio.datasets.LIBRISPEECH('$DATA_DIR', url='train-clean-100', download=True)
-print('Downloading dev-clean...', flush=True)
-torchaudio.datasets.LIBRISPEECH('$DATA_DIR', url='dev-clean', download=True)
-print('Download complete.', flush=True)
-"
-        log "LibriSpeech downloaded. Caching for future pods..."
-
-        # Cache to S3
-        if [ "$USE_S3" = "true" ]; then
-            log "Uploading LibriSpeech to S3..."
-            tar -czf /workspace/librispeech.tar.gz -C $DATA_DIR LibriSpeech \
-                && aws s3 cp /workspace/librispeech.tar.gz "s3://${AWS_S3_BUCKET}/datasets/librispeech.tar.gz" --only-show-errors \
-                && rm /workspace/librispeech.tar.gz \
-                && log "Cached to S3" \
-                || log "Warning: S3 cache upload failed"
-        fi
-
-        # Cache to GitHub Releases (split into <1.9GB parts)
-        log "Packaging LibriSpeech for GitHub Releases..."
-        gh release view "datasets" --repo "$GH_REPO" >/dev/null 2>&1 \
-            || gh release create "datasets" --repo "$GH_REPO" \
-                --title "Training datasets" \
-                --notes "Cached LibriSpeech — downloaded once, reused by all pods" \
-                --prerelease || true
-        tar -czf /workspace/librispeech_full.tar.gz -C $DATA_DIR LibriSpeech \
-            && split -b 1900m /workspace/librispeech_full.tar.gz /workspace/librispeech_ \
-            && rm /workspace/librispeech_full.tar.gz || true
-        # Rename split parts with .tar.gz extension
-        for f in /workspace/librispeech_??; do
-            mv "$f" "${f}.tar.gz" 2>/dev/null || true
-        done
-        SPLIT_FILES=$(ls /workspace/librispeech_*.tar.gz 2>/dev/null)
-        if [ -n "$SPLIT_FILES" ]; then
-            gh release upload "datasets" $SPLIT_FILES --repo "$GH_REPO" --clobber \
-                && log "Cached $(echo "$SPLIT_FILES" | wc -w) parts to GitHub Releases" \
-                || log "Warning: GitHub Releases cache upload failed"
-            rm -f /workspace/librispeech_*.tar.gz
-        fi
+        log "No cache found — letting torchaudio download during training (first epoch will be slow)."
+        # Don't pre-download here. torchaudio downloads on first access.
+        # Training script handles download via download=True in the dataset constructor.
     fi
 fi
 
