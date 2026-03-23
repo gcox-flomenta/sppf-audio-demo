@@ -43,7 +43,8 @@ log "Disk usage: $(df -h /workspace | tail -1)"
 # 1. Install dependencies
 # ─────────────────────────────────────────────
 log "--- Step 1: Installing dependencies ---"
-pip install -q torchaudio tqdm pillow awscli  # torch already in RunPod image — never reinstall
+pip install -q torchaudio tqdm pillow awscli soundfile  # torch already in RunPod image — never reinstall
+apt-get update -q && apt-get install -y libsndfile1 --quiet  # torchaudio needs libsndfile for .flac (LibriSpeech)
 log "pip done"
 apt-get update -q
 apt-get install -y curl --quiet
