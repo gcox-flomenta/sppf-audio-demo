@@ -81,7 +81,7 @@ cd $REPO_DIR
 log "PWD: $(pwd)"
 
 # ─────────────────────────────────────────────
-# 3. Dataset — LibriSpeech (cached to avoid re-downloading every pod)
+# 3. Dataset — LibriSpeech (fast download via aria2c)
 # ─────────────────────────────────────────────
 log "--- Step 3: Dataset ---"
 mkdir -p $DATA_DIR
@@ -93,45 +93,28 @@ log "Existing FLAC files on volume: $FLAC_COUNT"
 if [ "$FLAC_COUNT" -gt 50 ]; then
     log "LibriSpeech already cached on volume — skipping download."
 else
-    RESTORED=false
+    # Install aria2c for fast parallel downloads
+    apt-get install -y aria2 --quiet 2>/dev/null || true
 
-    # Try S3 cache first
-    if [ "$USE_S3" = "true" ]; then
-        log "Checking S3 for cached LibriSpeech..."
-        if aws s3 ls "s3://${AWS_S3_BUCKET}/datasets/librispeech.tar.gz" > /dev/null 2>&1; then
-            log "Downloading LibriSpeech from S3..."
-            aws s3 cp "s3://${AWS_S3_BUCKET}/datasets/librispeech.tar.gz" /workspace/librispeech.tar.gz --only-show-errors \
-                && tar -xzf /workspace/librispeech.tar.gz -C $DATA_DIR \
-                && rm /workspace/librispeech.tar.gz \
-                && RESTORED=true \
-                && log "LibriSpeech restored from S3" \
-                || log "S3 restore failed"
-        fi
-    fi
+    # Download train-clean-100 (~6.3GB) and dev-clean (~350MB) from OpenSLR
+    # aria2c uses 16 connections = 5-10x faster than single-threaded wget
+    TRAIN_URL="https://www.openslr.org/resources/12/train-clean-100.tar.gz"
+    DEV_URL="https://www.openslr.org/resources/12/dev-clean.tar.gz"
 
-    # Try GitHub Releases cache (split into <2GB parts)
-    if [ "$RESTORED" = "false" ]; then
-        log "Checking 'datasets' release for cached LibriSpeech..."
-        if gh release download "datasets" --repo "$GH_REPO" --pattern "librispeech_*.tar.gz" --dir /workspace 2>/dev/null; then
-            PARTS=$(ls /workspace/librispeech_*.tar.gz 2>/dev/null | sort)
-            if [ -n "$PARTS" ]; then
-                log "Downloaded $(echo "$PARTS" | wc -l) parts — reassembling..."
-                cat $PARTS | tar -xzf - -C $DATA_DIR \
-                    && RESTORED=true \
-                    && log "LibriSpeech restored from GitHub Releases" \
-                    || log "Reassembly failed"
-                rm -f /workspace/librispeech_*.tar.gz
-            fi
-        else
-            log "No cached dataset in GitHub Releases"
-        fi
-    fi
+    log "Downloading train-clean-100 via aria2c (16 connections)..."
+    aria2c -x 16 -s 16 -k 1M --dir=/workspace --out=train-clean-100.tar.gz "$TRAIN_URL" \
+        && log "train-clean-100 downloaded" \
+        || { log "aria2c failed, falling back to wget"; wget -q -O /workspace/train-clean-100.tar.gz "$TRAIN_URL"; }
 
-    if [ "$RESTORED" = "false" ]; then
-        log "No cache found — letting torchaudio download during training (first epoch will be slow)."
-        # Don't pre-download here. torchaudio downloads on first access.
-        # Training script handles download via download=True in the dataset constructor.
-    fi
+    log "Downloading dev-clean via aria2c..."
+    aria2c -x 16 -s 16 -k 1M --dir=/workspace --out=dev-clean.tar.gz "$DEV_URL" \
+        && log "dev-clean downloaded" \
+        || { log "aria2c failed, falling back to wget"; wget -q -O /workspace/dev-clean.tar.gz "$DEV_URL"; }
+
+    log "Extracting..."
+    tar -xzf /workspace/train-clean-100.tar.gz -C $DATA_DIR && rm /workspace/train-clean-100.tar.gz
+    tar -xzf /workspace/dev-clean.tar.gz -C $DATA_DIR && rm /workspace/dev-clean.tar.gz
+    log "Extraction complete."
 fi
 
 FLAC_COUNT=$(find $DATA_DIR/LibriSpeech -name "*.flac" 2>/dev/null | head -100 | wc -l)
