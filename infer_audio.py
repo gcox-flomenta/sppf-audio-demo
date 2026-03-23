@@ -256,8 +256,16 @@ def load_audio(audio_path: Path):
         # Point pydub to imageio-ffmpeg's bundled binary (no system install needed)
         try:
             import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            import pydub.utils
+            pydub.utils.PLAYER_NOT_FOUND_WARNING = False
+            # Set both converter and ffprobe to the imageio binary
+            # ffmpeg can act as ffprobe with -show_format etc.
             import pydub
-            pydub.AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
+            pydub.AudioSegment.converter = ffmpeg_exe
+            pydub.AudioSegment.ffmpeg = ffmpeg_exe
+            # Also patch the ffprobe lookup
+            pydub.utils.get_prober_name = lambda: ffmpeg_exe
         except ImportError:
             pass
         from pydub import AudioSegment
