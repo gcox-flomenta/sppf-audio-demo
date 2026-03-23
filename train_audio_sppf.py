@@ -413,6 +413,69 @@ def compute_pesq_batch(original, reconstructed, sr=16000):
 
 
 # ─────────────────────────────────────────────
+# Multi-Scale Waveform Discriminator
+# Same idea as the video model's PatchGAN — forces the decoder to
+# produce realistic waveforms, not muffled MSE-average output.
+# Operates at 2 scales: original (320 samples) and downsampled (160).
+# ─────────────────────────────────────────────
+
+class WaveformDiscriminator(nn.Module):
+    """Single-scale 1D PatchGAN discriminator with spectral norm."""
+
+    def __init__(self):
+        super().__init__()
+        sn = nn.utils.spectral_norm
+        self.net = nn.Sequential(
+            sn(nn.Conv1d(1, 32, 15, stride=1, padding=7)),
+            nn.LeakyReLU(0.2, inplace=True),
+            sn(nn.Conv1d(32, 64, 41, stride=4, padding=20, groups=4)),
+            nn.LeakyReLU(0.2, inplace=True),
+            sn(nn.Conv1d(64, 128, 41, stride=4, padding=20, groups=16)),
+            nn.LeakyReLU(0.2, inplace=True),
+            sn(nn.Conv1d(128, 256, 41, stride=4, padding=20, groups=16)),
+            nn.LeakyReLU(0.2, inplace=True),
+            sn(nn.Conv1d(256, 256, 5, stride=1, padding=2)),
+            nn.LeakyReLU(0.2, inplace=True),
+            sn(nn.Conv1d(256, 1, 3, stride=1, padding=1)),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class MultiScaleDiscriminator(nn.Module):
+    """Multi-scale discriminator: original + 2x downsampled."""
+
+    def __init__(self):
+        super().__init__()
+        self.disc1 = WaveformDiscriminator()
+        self.disc2 = WaveformDiscriminator()
+        self.downsample = nn.AvgPool1d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        """Returns list of discriminator outputs at each scale."""
+        d1 = self.disc1(x)
+        d2 = self.disc2(self.downsample(x))
+        return [d1, d2]
+
+
+def disc_loss_fn(real_outputs, fake_outputs):
+    """Hinge loss for discriminator."""
+    loss = 0
+    for dr, df in zip(real_outputs, fake_outputs):
+        loss += torch.mean(F.relu(1 - dr)) + torch.mean(F.relu(1 + df))
+    return loss / len(real_outputs)
+
+
+def gen_loss_fn(fake_outputs):
+    """Generator adversarial loss (hinge)."""
+    loss = 0
+    for df in fake_outputs:
+        loss += -torch.mean(df)
+    return loss / len(fake_outputs)
+
+
+# ─────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────
 
@@ -433,12 +496,25 @@ def train(args):
     print(f"  -> FSQ {model.quantizer.d_fsq} dims x {model.quantizer.levels[0]} levels = {bits_per_frame} bits/frame")
     print(f"  -> 50 fps = {bits_per_frame * 50 / 1000:.1f} kbps")
 
+    # ── Discriminator ──
+    disc = MultiScaleDiscriminator().to(device)
+    n_disc_params = sum(p.numel() for p in disc.parameters())
+    print(f"Discriminator parameters: {n_disc_params:,}")
+
     # ── Loss ──
     stft_loss_fn = MultiResolutionSTFTLoss(fft_sizes=(64, 128, 256)).to(device)
 
-    # ── Optimizer ──
+    # GAN warmup: don't enable GAN loss until the model has basic reconstruction
+    W_GAN = 0.0
+    W_GAN_TARGET = 0.1  # ramp up after warmup epochs
+    GAN_WARMUP_EPOCHS = 10
+
+    # ── Optimizers ──
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=1e-4
+    )
+    opt_disc = torch.optim.AdamW(
+        disc.parameters(), lr=args.lr, weight_decay=1e-4
     )
 
     # ── Dataset ──
@@ -480,6 +556,9 @@ def train(args):
         ckpt = torch.load(ckpt_latest, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["opt_state_dict"])
+        if "disc_state_dict" in ckpt:
+            disc.load_state_dict(ckpt["disc_state_dict"])
+            opt_disc.load_state_dict(ckpt["opt_disc_state_dict"])
         ema_shadow = ckpt["ema_shadow"]
         start_epoch = ckpt["epoch"] + 1
         best_loss = ckpt["best_loss"]
@@ -491,12 +570,20 @@ def train(args):
 
     for epoch in range(start_epoch, args.num_epochs):
         model.train()
+        disc.train()
         epoch_loss = 0.0
         n_steps = 0
+
+        # GAN warmup ramp
+        if epoch >= GAN_WARMUP_EPOCHS:
+            W_GAN = min(W_GAN_TARGET, W_GAN_TARGET * (epoch - GAN_WARMUP_EPOCHS + 1) / 10)
+        else:
+            W_GAN = 0.0
 
         for step, chunks in enumerate(train_loader):
             chunks = chunks.to(device)  # [B, 1, 320]
 
+            # ── Generator step ──
             recon, z_cont, z_q = model(chunks)
 
             # MSE loss (time domain)
@@ -508,12 +595,32 @@ def train(args):
             # Quantization commitment loss
             quant_loss = F.mse_loss(z_cont, z_q.detach())
 
-            total_loss = mse_loss + stft_loss + 0.1 * quant_loss
+            # GAN generator loss
+            if W_GAN > 0:
+                fake_outputs = disc(recon)
+                g_adv_loss = gen_loss_fn(fake_outputs)
+            else:
+                g_adv_loss = torch.tensor(0.0, device=device)
+
+            total_loss = mse_loss + stft_loss + 0.1 * quant_loss + W_GAN * g_adv_loss
 
             optimizer.zero_grad()
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+
+            # ── Discriminator step (every other step) ──
+            if W_GAN > 0 and step % 2 == 0:
+                with torch.no_grad():
+                    recon_d = model(chunks)[0]
+                real_outputs = disc(chunks)
+                fake_outputs = disc(recon_d.detach())
+                d_loss = disc_loss_fn(real_outputs, fake_outputs)
+
+                opt_disc.zero_grad()
+                d_loss.backward()
+                torch.nn.utils.clip_grad_norm_(disc.parameters(), 1.0)
+                opt_disc.step()
 
             ema_update(ema_shadow, model, decay=0.999)
 
@@ -521,10 +628,11 @@ def train(args):
             n_steps += 1
 
             if (step + 1) % 50 == 0:
+                gan_str = f"gan={g_adv_loss.item():.4f} " if W_GAN > 0 else ""
                 print(
                     f"  epoch {epoch+1}/{args.num_epochs} step {step+1}/{len(train_loader)} | "
                     f"total={total_loss.item():.4f} mse={mse_loss.item():.4f} "
-                    f"stft={stft_loss.item():.4f} quant={quant_loss.item():.4f} "
+                    f"stft={stft_loss.item():.4f} quant={quant_loss.item():.4f} {gan_str}"
                     f"lr={optimizer.param_groups[0]['lr']:.2e}"
                 )
 
@@ -581,6 +689,8 @@ def train(args):
         ckpt_data = {
             "model_state_dict": model.state_dict(),
             "opt_state_dict": optimizer.state_dict(),
+            "disc_state_dict": disc.state_dict(),
+            "opt_disc_state_dict": opt_disc.state_dict(),
             "ema_shadow": ema_shadow,
             "epoch": epoch,
             "best_loss": best_loss,
