@@ -251,34 +251,34 @@ def load_audio(audio_path: Path):
             data = data.mean(axis=1)
         return torch.from_numpy(data).unsqueeze(0), sr
 
-    # Try pydub for m4a/mp3/aac — auto-find ffmpeg from imageio-ffmpeg if available
+    # For non-wav/flac formats (m4a, mp3, aac, etc.), convert to wav via ffmpeg
+    # Uses imageio-ffmpeg's bundled binary — no system install needed
     try:
-        # Point pydub to imageio-ffmpeg's bundled binary (no system install needed)
-        try:
-            import imageio_ffmpeg
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-            import pydub.utils
-            pydub.utils.PLAYER_NOT_FOUND_WARNING = False
-            # Set both converter and ffprobe to the imageio binary
-            # ffmpeg can act as ffprobe with -show_format etc.
-            import pydub
-            pydub.AudioSegment.converter = ffmpeg_exe
-            pydub.AudioSegment.ffmpeg = ffmpeg_exe
-            # Also patch the ffprobe lookup
-            pydub.utils.get_prober_name = lambda: ffmpeg_exe
-        except ImportError:
-            pass
-        from pydub import AudioSegment
-        import numpy as np
-        seg = AudioSegment.from_file(str(audio_path))
-        seg = seg.set_channels(1)
-        sr = seg.frame_rate
-        samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
-        samples = samples / (2 ** (seg.sample_width * 8 - 1))  # normalize to [-1, 1]
-        return torch.from_numpy(samples).unsqueeze(0), sr
+        import subprocess, tempfile
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        tmp_wav = tempfile.mktemp(suffix=".wav")
+        result = subprocess.run(
+            [ffmpeg_exe, "-y", "-i", str(audio_path), "-ac", "1", "-ar", "16000", "-f", "wav", tmp_wav],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {result.stderr[:200]}")
+        if HAS_SOUNDFILE:
+            data, sr = sf.read(tmp_wav, dtype="float32")
+        else:
+            import wave, numpy as np
+            with wave.open(tmp_wav) as wf:
+                sr = wf.getframerate()
+                data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+        import os; os.unlink(tmp_wav)
+        if hasattr(data, 'ndim') and data.ndim > 1:
+            data = data.mean(axis=1)
+        return torch.from_numpy(data).unsqueeze(0).float(), sr
+    except ImportError:
+        print("Install imageio-ffmpeg for m4a/mp3 support: pip install imageio-ffmpeg")
     except Exception as e:
-        print(f"pydub failed: {e}")
-        pass
+        print(f"ffmpeg conversion failed: {e}")
 
     # Try torchaudio as last resort
     if HAS_TORCHAUDIO:
