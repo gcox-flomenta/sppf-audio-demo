@@ -1,14 +1,14 @@
 """
-train_audio_sppf.py — SPPF Audio Autoencoder Training
+train_audio_sppf.py -- SPPF Audio Autoencoder Training (v2: FSQ quantization)
 
-Compresses 20ms speech frames (320 samples @ 16kHz) into a 64-byte latent
-using Golden Ratio Quantization, then reconstructs. Replaces Opus for voice calls.
+Compresses 20ms speech frames (320 samples @ 16kHz) into a compact FSQ-quantized
+latent, then reconstructs. Replaces Opus for voice calls.
 
 Architecture:
-  Encoder (Conv1d):  [B, 1, 320] → 4 strided stages → [B, latent_dim]
-  SPPF Core (MLP):   [B, latent_dim] → [B, latent_dim]
-  GR Quantizer:      64 floats → 64 bytes (8-bit, phi-spaced)
-  Decoder (Conv1d):  [B, latent_dim] → 4 upsample stages → [B, 1, 320]
+  Encoder (Conv1d):  [B, 1, 320] -> 4 strided stages -> [B, latent_dim]
+  SPPF Core (MLP):   [B, latent_dim] -> [B, latent_dim]
+  FSQ Quantizer:     64 floats -> 32 dims x 5 levels = 74 bits/frame = 3.7 kbps
+  Decoder (Conv1d):  [B, latent_dim] -> 4 upsample stages -> [B, 1, 320]
 
 Loss:
   MSE (time domain) + Multi-resolution STFT (frequency domain) + Quantization commitment
@@ -16,7 +16,7 @@ Loss:
 Dataset: LibriSpeech train-clean-100 / dev-clean (auto-download via torchaudio)
 
 Usage:
-  python train_audio_sppf.py --output_dir outputs_audio --num_epochs 50 --batch_size 64
+  python train_audio_sppf.py --output_dir outputs_audio --num_epochs 200 --batch_size 64
 """
 
 import argparse
@@ -34,76 +34,76 @@ import torchaudio
 
 
 # ─────────────────────────────────────────────
-# Golden Ratio Quantizer (inline)
-# φ-spaced bucket boundaries for 8-bit quantization.
-# Straight-through estimator: forward uses quantized, backward uses continuous.
+# FSQ (Finite Scalar Quantization)
+# Each latent dimension independently rounds to fixed levels.
+# No codebook collapse, no dead codes, 97.6% utilization proven in SEM.
+# Straight-through estimator for end-to-end training.
+#
+# 32 dims x 5 levels = 5^32 possible codes (~10^22)
+# 32 x log2(5) = ~74 bits/frame = 3.7 kbps at 50 fps
+# With DESE suppression (85%): ~0.6 kbps effective
 # ─────────────────────────────────────────────
 
-PHI = (1.0 + math.sqrt(5.0)) / 2.0  # 1.6180339887...
-
-
-def _golden_ratio_boundaries(n_bits: int = 8, max_scale: float = 1.0) -> torch.Tensor:
-    """Generate symmetric quantization boundaries with golden ratio width spacing."""
-    n_levels = 2 ** n_bits
-    n_positive = n_levels // 2 - 1
-
-    width_ratio = PHI ** (2.0 / max(n_positive, 1))
-
-    k = torch.arange(n_positive, dtype=torch.float64)
-    widths = torch.pow(torch.tensor(width_ratio), k)
-
-    positive = widths.cumsum(0)
-    positive = positive * (max_scale / positive[-1])
-
-    negative = -positive.flip(0)
-    boundaries = torch.cat([negative, torch.zeros(1, dtype=torch.float64), positive])
-    return boundaries.float()
-
-
-class GoldenRatioQuantizer(nn.Module):
+class FSQQuantizer(nn.Module):
     """
-    8-bit quantizer with phi-spaced bucket boundaries.
-    Straight-through estimator for end-to-end training.
+    Finite Scalar Quantization — codebook-free, collapse-proof.
+
+    Projects latent_dim down to d_fsq dimensions, rounds each to fixed
+    levels, projects back up. Uses iFSQ activation (2*sigmoid(1.6*z)-1)
+    for uniform bin utilization.
+
+    Default: 32 dims x 5 levels = 3.7 kbps at 50 fps.
     """
 
-    def __init__(self, n_bits: int = 8):
+    def __init__(self, latent_dim: int = 64, levels: list = None):
         super().__init__()
-        self.n_bits = n_bits
-        self.n_levels = 2 ** n_bits
+        if levels is None:
+            levels = [5] * 32  # 32 dims, 5 levels each
+        self.levels = levels
+        self.d_fsq = len(levels)
+        self.latent_dim = latent_dim
 
-        boundaries = _golden_ratio_boundaries(n_bits, max_scale=1.0)
-        self.register_buffer("boundaries", boundaries)
+        # Project to/from FSQ space
+        self.project_down = nn.Linear(latent_dim, self.d_fsq)
+        self.project_up = nn.Linear(self.d_fsq, latent_dim)
 
-        # Representative values: midpoints between consecutive boundaries
-        padded = torch.cat([
-            boundaries[:1] - (boundaries[1] - boundaries[0]),
-            boundaries,
-            boundaries[-1:] + (boundaries[-1] - boundaries[-2]),
-        ])
-        rep_values = 0.5 * (padded[:-1] + padded[1:])
-        self.register_buffer("rep_values", rep_values)
+        # Init project_down with larger std so iFSQ spans all levels
+        nn.init.normal_(self.project_down.weight, std=2.0)
+        nn.init.zeros_(self.project_down.bias)
+
+        # Register levels as buffer
+        self.register_buffer("_levels_t", torch.tensor(levels, dtype=torch.float32))
+
+        # Bits per frame for logging
+        self.bits_per_frame = sum(math.ceil(math.log2(lv)) for lv in levels)
+
+    def _bound(self, z: torch.Tensor) -> torch.Tensor:
+        """iFSQ activation: maps to near-uniform distribution across bins."""
+        half = (self._levels_t - 1) / 2  # [2.0, ...] for L=5
+        return (2.0 * torch.sigmoid(1.6 * z) - 1.0) * half
 
     def forward(self, z: torch.Tensor):
         """
         Quantize with straight-through estimator.
 
         Returns:
-            z_q: quantized tensor (STE: forward=quantized, backward=continuous)
+            z_q: quantized tensor projected back to latent_dim (STE)
             z: original continuous tensor (for commitment loss)
         """
-        # Per-tensor scaling to [-1, 1]
-        scale = z.abs().amax().clamp(min=1e-8)
-        z_scaled = z / scale
+        # Project down to FSQ space
+        z_low = self.project_down(z)  # [B, d_fsq]
 
-        # Quantize
-        indices = torch.bucketize(z_scaled.contiguous(), self.boundaries)
-        z_q_scaled = self.rep_values[indices.long()]
+        # Bound to quantization range
+        z_bounded = self._bound(z_low)
 
-        # Unscale
-        z_q_raw = z_q_scaled * scale
+        # Round to nearest integer level
+        z_hat = torch.round(z_bounded)
 
-        # Straight-through estimator: z_q has quantized values but z's gradients
-        z_q = z + (z_q_raw - z).detach()
+        # Straight-through estimator
+        z_hat_st = z_bounded + (z_hat - z_bounded).detach()
+
+        # Project back to latent_dim
+        z_q = self.project_up(z_hat_st)  # [B, latent_dim]
 
         return z_q, z
 
@@ -251,7 +251,7 @@ class SPPFAudioAutoencoder(nn.Module):
         super().__init__()
         self.encoder_part = Encoder1d(latent_dim)
         self.sppf_core = SPPFCore1d(latent_dim)
-        self.quantizer = GoldenRatioQuantizer(n_bits=8)
+        self.quantizer = FSQQuantizer(latent_dim=latent_dim)
         self.decoder_part = Decoder1d(latent_dim)
 
     def forward(self, x):
@@ -409,10 +409,11 @@ def train(args):
     model = SPPFAudioAutoencoder(latent_dim=args.latent_dim).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
+    bits_per_frame = model.quantizer.bits_per_frame
     print(f"\nCompression stats:")
-    print(f"  {args.latent_dim} floats x 4 bytes = {args.latent_dim * 4} bytes/frame")
-    print(f"  -> GRQ 8-bit: {args.latent_dim} bytes/frame")
-    print(f"  -> 50 fps = {args.latent_dim * 50 * 8 / 1000:.1f} kbps")
+    print(f"  {args.latent_dim} floats x 4 bytes = {args.latent_dim * 4} bytes/frame (unquantized)")
+    print(f"  -> FSQ {model.quantizer.d_fsq} dims x {model.quantizer.levels[0]} levels = {bits_per_frame} bits/frame")
+    print(f"  -> 50 fps = {bits_per_frame * 50 / 1000:.1f} kbps")
 
     # ── Loss ──
     stft_loss_fn = MultiResolutionSTFTLoss(fft_sizes=(64, 128, 256)).to(device)
@@ -584,7 +585,7 @@ def main():
                         help="Directory for checkpoints and logs")
     parser.add_argument("--latent_dim", type=int, default=64,
                         help="Latent dimension size")
-    parser.add_argument("--num_epochs", type=int, default=50,
+    parser.add_argument("--num_epochs", type=int, default=200,
                         help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=64,
                         help="Batch size")
