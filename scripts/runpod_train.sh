@@ -266,6 +266,7 @@ log "Training process exited with code $TRAIN_EXIT"
 # ─────────────────────────────────────────────
 # 7. Upload final checkpoint
 # ─────────────────────────────────────────────
+set +e  # Disable exit-on-error — uploads must not be skipped
 log "--- Step 7: Uploading final assets ---"
 log "Output dir contents: $(ls $OUTPUT_DIR 2>/dev/null || echo 'empty')"
 
@@ -288,11 +289,18 @@ UPLOAD_FILES=""
 [ -f "$OUTPUT_DIR/ckpt_latest.pt" ] && UPLOAD_FILES="$UPLOAD_FILES $OUTPUT_DIR/ckpt_latest.pt"
 [ -f "$OUTPUT_DIR/resume.pt" ]      && UPLOAD_FILES="$UPLOAD_FILES $OUTPUT_DIR/resume.pt"
 
+log "Files to upload: $UPLOAD_FILES"
+log "Release tag: $RELEASE_TAG"
+log "gh auth check: $(gh auth status 2>&1 | head -1)"
+
 if [ -n "$UPLOAD_FILES" ]; then
+    log "Uploading to release $RELEASE_TAG..."
     gh release upload "$RELEASE_TAG" $UPLOAD_FILES \
-        --repo "$GH_REPO" --clobber \
+        --repo "$GH_REPO" --clobber 2>&1 \
         && log "Final GH upload succeeded" \
-        || log "Warning: final GH upload failed"
+        || log "Warning: final GH upload failed — exit code $?"
+else
+    log "WARNING: No checkpoint files found to upload!"
 fi
 
 # Final S3 sync
