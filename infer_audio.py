@@ -251,8 +251,15 @@ def load_audio(audio_path: Path):
             data = data.mean(axis=1)
         return torch.from_numpy(data).unsqueeze(0), sr
 
-    # Try pydub for m4a/mp3/aac (needs ffmpeg or just pydub)
+    # Try pydub for m4a/mp3/aac — auto-find ffmpeg from imageio-ffmpeg if available
     try:
+        # Point pydub to imageio-ffmpeg's bundled binary (no system install needed)
+        try:
+            import imageio_ffmpeg
+            import pydub
+            pydub.AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
+        except ImportError:
+            pass
         from pydub import AudioSegment
         import numpy as np
         seg = AudioSegment.from_file(str(audio_path))
@@ -261,7 +268,8 @@ def load_audio(audio_path: Path):
         samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
         samples = samples / (2 ** (seg.sample_width * 8 - 1))  # normalize to [-1, 1]
         return torch.from_numpy(samples).unsqueeze(0), sr
-    except Exception:
+    except Exception as e:
+        print(f"pydub failed: {e}")
         pass
 
     # Try torchaudio as last resort
