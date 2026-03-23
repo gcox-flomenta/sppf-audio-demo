@@ -419,6 +419,95 @@ def compute_pesq_batch(original, reconstructed, sr=16000):
 # Operates at 2 scales: original (320 samples) and downsampled (160).
 # ─────────────────────────────────────────────
 
+class MelSpectrogramLoss(nn.Module):
+    """Perceptually-weighted mel-spectrogram L1 loss.
+    Mel scale matches human hearing — more important than raw STFT for speech."""
+
+    def __init__(self, sr=16000, n_fft=1024, hop_length=256, n_mels=80):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.register_buffer(
+            "mel_basis",
+            self._mel_filterbank(sr, n_fft, n_mels)
+        )
+
+    @staticmethod
+    def _mel_filterbank(sr, n_fft, n_mels):
+        """Create mel filterbank matrix."""
+        # Simplified mel filterbank (linear in mel space)
+        f_min, f_max = 0.0, sr / 2.0
+        mel_min = 2595.0 * math.log10(1.0 + f_min / 700.0)
+        mel_max = 2595.0 * math.log10(1.0 + f_max / 700.0)
+        mel_points = torch.linspace(mel_min, mel_max, n_mels + 2)
+        hz_points = 700.0 * (10.0 ** (mel_points / 2595.0) - 1.0)
+        bins = torch.floor((n_fft + 1) * hz_points / sr).long()
+
+        fb = torch.zeros(n_mels, n_fft // 2 + 1)
+        for m in range(n_mels):
+            f_left, f_center, f_right = bins[m], bins[m + 1], bins[m + 2]
+            for k in range(f_left, f_center):
+                if f_center != f_left:
+                    fb[m, k] = (k - f_left) / (f_center - f_left)
+            for k in range(f_center, f_right):
+                if f_right != f_center:
+                    fb[m, k] = (f_right - k) / (f_right - f_center)
+        return fb
+
+    def forward(self, x_recon, x_target):
+        """x_recon, x_target: [B, 1, T]"""
+        x_r = x_recon.squeeze(1)
+        x_t = x_target.squeeze(1)
+
+        win = torch.hann_window(self.n_fft, device=x_r.device)
+        spec_r = torch.stft(x_r, self.n_fft, self.hop_length, window=win, return_complex=True).abs()
+        spec_t = torch.stft(x_t, self.n_fft, self.hop_length, window=win, return_complex=True).abs()
+
+        mel_r = torch.log(torch.matmul(self.mel_basis.to(x_r.device), spec_r) + 1e-8)
+        mel_t = torch.log(torch.matmul(self.mel_basis.to(x_t.device), spec_t) + 1e-8)
+
+        return F.l1_loss(mel_r, mel_t)
+
+
+def feature_matching_loss(disc, real, fake):
+    """Match intermediate discriminator features (pix2pixHD-style).
+    Gives the generator direct texture-level supervision."""
+    loss = 0.0
+    n_layers = 0
+    # Get features from each sub-discriminator
+    for sub_disc in [disc.disc1, disc.disc2]:
+        feat_real = []
+        feat_fake = []
+        x_r = real
+        x_f = fake
+        if sub_disc is disc.disc2:
+            x_r = disc.downsample(real)
+            x_f = disc.downsample(fake)
+        # Extract intermediate features
+        for layer in sub_disc.net:
+            x_r = layer(x_r)
+            x_f = layer(x_f)
+            feat_real.append(x_r)
+            feat_fake.append(x_f)
+        for fr, ff in zip(feat_real[:-1], feat_fake[:-1]):  # skip last (output)
+            loss += F.l1_loss(ff, fr.detach())
+            n_layers += 1
+    return loss / max(n_layers, 1)
+
+
+def r1_gradient_penalty(disc, real):
+    """R1 gradient penalty — stabilizes discriminator (StyleGAN2).
+    Penalizes the gradient of D with respect to real samples."""
+    real = real.detach().requires_grad_(True)
+    outputs = disc(real)
+    grad = torch.autograd.grad(
+        outputs=[sum(o.sum() for o in outputs)],
+        inputs=real,
+        create_graph=True,
+    )[0]
+    return grad.pow(2).reshape(grad.shape[0], -1).sum(1).mean()
+
+
 class WaveformDiscriminator(nn.Module):
     """Single-scale 1D PatchGAN discriminator with spectral norm."""
 
@@ -503,10 +592,14 @@ def train(args):
 
     # ── Loss ──
     stft_loss_fn = MultiResolutionSTFTLoss(fft_sizes=(64, 128, 256)).to(device)
+    mel_loss_fn = MelSpectrogramLoss(sr=16000, n_fft=256, hop_length=64, n_mels=64).to(device)
 
     # GAN warmup: don't enable GAN loss until the model has basic reconstruction
     W_GAN = 0.0
     W_GAN_TARGET = 0.1  # ramp up after warmup epochs
+    W_FEAT = 2.0        # feature matching weight (high — direct texture supervision)
+    W_R1 = 10.0         # R1 gradient penalty weight
+    W_MEL = 1.0         # mel spectrogram loss weight
     GAN_WARMUP_EPOCHS = 10
 
     # ── Optimizers ──
@@ -595,14 +688,22 @@ def train(args):
             # Quantization commitment loss
             quant_loss = F.mse_loss(z_cont, z_q.detach())
 
-            # GAN generator loss
+            # Mel spectrogram loss (perceptually weighted)
+            mel_loss = mel_loss_fn(recon, chunks)
+
+            # GAN generator loss + feature matching
             if W_GAN > 0:
                 fake_outputs = disc(recon)
                 g_adv_loss = gen_loss_fn(fake_outputs)
+                feat_loss = feature_matching_loss(disc, chunks, recon)
             else:
                 g_adv_loss = torch.tensor(0.0, device=device)
+                feat_loss = torch.tensor(0.0, device=device)
 
-            total_loss = mse_loss + stft_loss + 0.1 * quant_loss + W_GAN * g_adv_loss
+            total_loss = (mse_loss + stft_loss + W_MEL * mel_loss
+                         + 0.1 * quant_loss
+                         + W_GAN * g_adv_loss
+                         + W_GAN * W_FEAT * feat_loss)
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -617,6 +718,11 @@ def train(args):
                 fake_outputs = disc(recon_d.detach())
                 d_loss = disc_loss_fn(real_outputs, fake_outputs)
 
+                # R1 gradient penalty (every 16 steps to save compute)
+                if step % 16 == 0:
+                    r1_loss = r1_gradient_penalty(disc, chunks)
+                    d_loss = d_loss + W_R1 * r1_loss
+
                 opt_disc.zero_grad()
                 d_loss.backward()
                 torch.nn.utils.clip_grad_norm_(disc.parameters(), 1.0)
@@ -628,11 +734,12 @@ def train(args):
             n_steps += 1
 
             if (step + 1) % 50 == 0:
-                gan_str = f"gan={g_adv_loss.item():.4f} " if W_GAN > 0 else ""
+                gan_str = f"gan={g_adv_loss.item():.4f} feat={feat_loss.item():.4f} " if W_GAN > 0 else ""
                 print(
                     f"  epoch {epoch+1}/{args.num_epochs} step {step+1}/{len(train_loader)} | "
                     f"total={total_loss.item():.4f} mse={mse_loss.item():.4f} "
-                    f"stft={stft_loss.item():.4f} quant={quant_loss.item():.4f} {gan_str}"
+                    f"stft={stft_loss.item():.4f} mel={mel_loss.item():.4f} "
+                    f"quant={quant_loss.item():.4f} {gan_str}"
                     f"lr={optimizer.param_groups[0]['lr']:.2e}"
                 )
 
