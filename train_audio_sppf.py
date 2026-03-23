@@ -394,6 +394,24 @@ def compute_snr(original, reconstructed):
     return 10 * math.log10(signal_power.item() / noise_power.item())
 
 
+def compute_pesq_batch(original, reconstructed, sr=16000):
+    """Compute PESQ (ITU-T P.862) on a batch. Returns mean score or None."""
+    try:
+        from pesq import pesq as pesq_fn
+    except ImportError:
+        return None
+    scores = []
+    orig_np = original.squeeze(1).cpu().numpy()  # [B, T]
+    recon_np = reconstructed.squeeze(1).cpu().numpy()
+    for i in range(orig_np.shape[0]):
+        try:
+            score = pesq_fn(sr, orig_np[i], recon_np[i], 'wb')  # wideband
+            scores.append(score)
+        except Exception:
+            continue
+    return sum(scores) / len(scores) if scores else None
+
+
 # ─────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────
@@ -517,6 +535,7 @@ def train(args):
         model.eval()
         val_loss_sum = 0.0
         val_snr_sum = 0.0
+        val_pesq_scores = []
         val_steps = 0
 
         # Load EMA weights for validation
@@ -535,18 +554,27 @@ def train(args):
 
                 val_loss_sum += total_loss.item()
                 val_snr_sum += compute_snr(chunks, recon)
+
+                # PESQ every 10 epochs (expensive, ~1 sample per batch)
+                if (epoch + 1) % 10 == 0 and val_steps < 10:
+                    pesq_score = compute_pesq_batch(chunks[:4], recon[:4])
+                    if pesq_score is not None:
+                        val_pesq_scores.append(pesq_score)
+
                 val_steps += 1
 
         avg_val_loss = val_loss_sum / max(val_steps, 1)
         avg_val_snr = val_snr_sum / max(val_steps, 1)
+        avg_pesq = sum(val_pesq_scores) / len(val_pesq_scores) if val_pesq_scores else None
 
         # Restore training weights
         model.load_state_dict(orig_state)
 
+        pesq_str = f" PESQ={avg_pesq:.2f}" if avg_pesq is not None else ""
         print(
             f"Epoch {epoch+1}/{args.num_epochs} | "
             f"train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f} "
-            f"val_SNR={avg_val_snr:.2f} dB"
+            f"val_SNR={avg_val_snr:.2f} dB{pesq_str}"
         )
 
         # ── Checkpointing ──

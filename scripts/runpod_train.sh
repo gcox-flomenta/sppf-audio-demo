@@ -44,7 +44,7 @@ log "Disk usage: $(df -h /workspace | tail -1)"
 # 1. Install dependencies
 # ─────────────────────────────────────────────
 log "--- Step 1: Installing dependencies ---"
-pip install -q torchaudio tqdm pillow awscli soundfile  # torch already in RunPod image — never reinstall
+pip install -q torchaudio tqdm pillow awscli soundfile pesq  # torch already in RunPod image — never reinstall
 log "pip done"
 apt-get update -q && apt-get install -y libsndfile1 curl --quiet
 log "apt done"
