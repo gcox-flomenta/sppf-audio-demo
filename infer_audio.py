@@ -322,10 +322,11 @@ def resample_audio(waveform, orig_sr, target_sr=16000):
 
 def save_wav(waveform, path: Path, sr=16000):
     """Save waveform [1, T] as WAV."""
-    if HAS_TORCHAUDIO:
-        torchaudio.save(str(path), waveform, sr)
-    elif HAS_SOUNDFILE:
+    # Use soundfile first (doesn't need torchcodec)
+    if HAS_SOUNDFILE:
         sf.write(str(path), waveform.squeeze(0).numpy(), sr)
+    elif HAS_TORCHAUDIO:
+        torchaudio.save(str(path), waveform, sr)
     else:
         print(f"WARNING: Cannot save {path} -- no audio backend available.")
 
