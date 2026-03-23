@@ -218,8 +218,12 @@ log "Training PID: $TRAIN_PID"
 
 # Upload ckpt_latest.pt every 20 minutes while training runs
 LAST_UPLOAD_TIME=0
-while kill -0 $TRAIN_PID 2>/dev/null; do
-    sleep 1200  # 20 minutes
+while kill -0 $TRAIN_PID 2>/dev/null || false; do
+    # Short sleep loop so we detect training completion quickly
+    for i in $(seq 1 120); do  # 120 x 10s = 20 min
+        kill -0 $TRAIN_PID 2>/dev/null || break 2  # training done, exit both loops
+        sleep 10
+    done
 
     if [ -f "$OUTPUT_DIR/ckpt_latest.pt" ]; then
         CURRENT_EPOCH=$(python3 -c "import torch; c=torch.load('$OUTPUT_DIR/ckpt_latest.pt', map_location='cpu', weights_only=False); print(c.get('epoch',0))" 2>/dev/null || echo "?")
@@ -255,7 +259,7 @@ while kill -0 $TRAIN_PID 2>/dev/null; do
     fi
 done
 
-wait $TRAIN_PID
+wait $TRAIN_PID || true
 TRAIN_EXIT=$?
 log "Training process exited with code $TRAIN_EXIT"
 
