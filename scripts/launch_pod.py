@@ -5,10 +5,18 @@ Reads all config from environment variables set by the workflow.
 Audio model is ~591K params (vs 100M+ for video) so trains much faster.
 RTX 4090 is overkill but keeps things simple; expect fast epoch times.
 """
-import os, json, requests, sys
+import os, json, requests, sys, subprocess
 
 api_key    = os.environ["RUNPOD_API_KEY"]
-gh_token   = os.environ["GH_TOKEN"]
+gh_token   = os.environ.get("GH_TOKEN", "")
+if not gh_token:
+    # Fall back to gh CLI auth token
+    try:
+        gh_token = subprocess.check_output(["gh", "auth", "token"], text=True).strip()
+        print(f"  GH_TOKEN from gh CLI: {gh_token[:10]}...")
+    except Exception:
+        print("ERROR: No GH_TOKEN env var and 'gh auth token' failed. Set GH_TOKEN or run 'gh auth login'.")
+        sys.exit(1)
 gh_repo    = os.environ["GH_REPO"]
 latent_dim = os.environ.get("LATENT_DIM", "64")
 num_epochs = os.environ.get("NUM_EPOCHS", "50")
