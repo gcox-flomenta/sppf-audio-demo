@@ -242,21 +242,50 @@ class SPPFAudioAutoencoder(nn.Module):
 
 def load_audio(audio_path: Path):
     """Load audio file, return (waveform [1, T], sample_rate)."""
-    if HAS_TORCHAUDIO:
-        waveform, sr = torchaudio.load(str(audio_path))
-        # Convert to mono
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        return waveform, sr
-    elif HAS_SOUNDFILE:
+    suffix = audio_path.suffix.lower()
+
+    # Try soundfile first (reliable for wav/flac, no torchcodec needed)
+    if HAS_SOUNDFILE and suffix in {".wav", ".flac", ".ogg"}:
         data, sr = sf.read(str(audio_path), dtype="float32")
         if data.ndim > 1:
             data = data.mean(axis=1)
-        waveform = torch.from_numpy(data).unsqueeze(0)  # [1, T]
-        return waveform, sr
-    else:
-        print("ERROR: Install torchaudio or soundfile to load audio.")
-        sys.exit(1)
+        return torch.from_numpy(data).unsqueeze(0), sr
+
+    # Try pydub for m4a/mp3/aac (needs ffmpeg or just pydub)
+    try:
+        from pydub import AudioSegment
+        import numpy as np
+        seg = AudioSegment.from_file(str(audio_path))
+        seg = seg.set_channels(1)
+        sr = seg.frame_rate
+        samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
+        samples = samples / (2 ** (seg.sample_width * 8 - 1))  # normalize to [-1, 1]
+        return torch.from_numpy(samples).unsqueeze(0), sr
+    except Exception:
+        pass
+
+    # Try torchaudio as last resort
+    if HAS_TORCHAUDIO:
+        try:
+            waveform, sr = torchaudio.load(str(audio_path))
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            return waveform, sr
+        except Exception as e:
+            print(f"torchaudio failed: {e}")
+
+    # Try soundfile for any remaining format
+    if HAS_SOUNDFILE:
+        try:
+            data, sr = sf.read(str(audio_path), dtype="float32")
+            if data.ndim > 1:
+                data = data.mean(axis=1)
+            return torch.from_numpy(data).unsqueeze(0), sr
+        except Exception:
+            pass
+
+    print(f"ERROR: Cannot load {suffix} files. Install pydub (`pip install pydub`) for m4a/mp3 support.")
+    sys.exit(1)
 
 
 def resample_audio(waveform, orig_sr, target_sr=16000):
