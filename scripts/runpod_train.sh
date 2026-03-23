@@ -29,6 +29,7 @@ LATENT_DIM=${LATENT_DIM:-64}
 NUM_EPOCHS=${NUM_EPOCHS:-50}
 BATCH_SIZE=${BATCH_SIZE:-64}
 LR=${LR:-3e-4}
+DATASET=${DATASET:-train-clean-100}
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
@@ -252,7 +253,8 @@ python train_audio_sppf.py \
     --latent_dim $LATENT_DIM \
     --num_epochs $NUM_EPOCHS \
     --batch_size $BATCH_SIZE \
-    --lr $LR &
+    --lr $LR \
+    --dataset $DATASET &
 TRAIN_PID=$!
 log "Training PID: $TRAIN_PID"
 

@@ -22,6 +22,7 @@ latent_dim = os.environ.get("LATENT_DIM", "64")
 num_epochs = os.environ.get("NUM_EPOCHS", "50")
 batch_size = os.environ.get("BATCH_SIZE", "64")
 lr         = os.environ.get("LR", "3e-4")
+dataset    = os.environ.get("DATASET", "train-clean-100")
 gpu_pref   = os.environ.get("GPU_TYPE", "NVIDIA GeForce RTX 4090")
 # S3 — optional; if not set, falls back to GitHub Releases
 s3_key     = os.environ.get("AWS_ACCESS_KEY_ID", "")
@@ -92,6 +93,7 @@ for gpu_type in GPU_FALLBACK_ORDER:
                 {"key": "NUM_EPOCHS",              "value": num_epochs},
                 {"key": "BATCH_SIZE",              "value": batch_size},
                 {"key": "LR",                      "value": lr},
+                {"key": "DATASET",                 "value": dataset},
                 {"key": "RUNPOD_API_KEY",          "value": api_key},
                 {"key": "AWS_ACCESS_KEY_ID",       "value": s3_key},
                 {"key": "AWS_SECRET_ACCESS_KEY",   "value": s3_secret},
@@ -124,5 +126,5 @@ print(f"Pod launched!")
 print(f"  Pod ID:  {pod['id']}")
 print(f"  GPU:     {used_gpu}")
 print(f"  Cost:    ${pod['costPerHr']:.3f}/hr")
-print(f"  Config:  latent_dim={latent_dim} epochs={num_epochs} batch={batch_size} lr={lr}")
+print(f"  Config:  latent_dim={latent_dim} epochs={num_epochs} batch={batch_size} lr={lr} dataset={dataset}")
 print(f"  Results: https://github.com/{gh_repo}/releases")

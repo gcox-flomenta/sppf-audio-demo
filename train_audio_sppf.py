@@ -423,9 +423,9 @@ def train(args):
     )
 
     # ── Dataset ──
-    print("\nLoading LibriSpeech train-clean-100...")
+    print(f"\nLoading LibriSpeech {args.dataset}...")
     train_dataset = LibriSpeechChunks(
-        root=args.data_dir, url="train-clean-100", download=True
+        root=args.data_dir, url=args.dataset, download=True
     )
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -594,6 +594,8 @@ def main():
                         help="DataLoader workers")
     parser.add_argument("--data_dir", type=str, default="data",
                         help="Root directory for LibriSpeech data")
+    parser.add_argument("--dataset", type=str, default="train-clean-100",
+                        help="LibriSpeech split for training (dev-clean for quick test)")
     args = parser.parse_args()
     train(args)
 
