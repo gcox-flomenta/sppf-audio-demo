@@ -82,11 +82,101 @@ cd $REPO_DIR
 log "PWD: $(pwd)"
 
 # ─────────────────────────────────────────────
-# 3. Dataset — LibriSpeech (auto-downloaded by torchaudio)
+# 3. Dataset — LibriSpeech (cached to avoid re-downloading every pod)
 # ─────────────────────────────────────────────
 log "--- Step 3: Dataset ---"
-log "LibriSpeech will be auto-downloaded by torchaudio to $DATA_DIR (~6GB)"
 mkdir -p $DATA_DIR
+
+# Check if LibriSpeech already on volume (survives pod restarts)
+FLAC_COUNT=$(find $DATA_DIR/LibriSpeech -name "*.flac" 2>/dev/null | head -100 | wc -l)
+log "Existing FLAC files on volume: $FLAC_COUNT"
+
+if [ "$FLAC_COUNT" -gt 50 ]; then
+    log "LibriSpeech already cached on volume — skipping download."
+else
+    RESTORED=false
+
+    # Try S3 cache first
+    if [ "$USE_S3" = "true" ]; then
+        log "Checking S3 for cached LibriSpeech..."
+        if aws s3 ls "s3://${AWS_S3_BUCKET}/datasets/librispeech.tar.gz" > /dev/null 2>&1; then
+            log "Downloading LibriSpeech from S3..."
+            aws s3 cp "s3://${AWS_S3_BUCKET}/datasets/librispeech.tar.gz" /workspace/librispeech.tar.gz --only-show-errors \
+                && tar -xzf /workspace/librispeech.tar.gz -C $DATA_DIR \
+                && rm /workspace/librispeech.tar.gz \
+                && RESTORED=true \
+                && log "LibriSpeech restored from S3" \
+                || log "S3 restore failed"
+        fi
+    fi
+
+    # Try GitHub Releases cache (split into <2GB parts)
+    if [ "$RESTORED" = "false" ]; then
+        log "Checking 'datasets' release for cached LibriSpeech..."
+        if gh release download "datasets" --repo "$GH_REPO" --pattern "librispeech_*.tar.gz" --dir /workspace 2>/dev/null; then
+            PARTS=$(ls /workspace/librispeech_*.tar.gz 2>/dev/null | sort)
+            if [ -n "$PARTS" ]; then
+                log "Downloaded $(echo "$PARTS" | wc -l) parts — reassembling..."
+                cat $PARTS | tar -xzf - -C $DATA_DIR \
+                    && RESTORED=true \
+                    && log "LibriSpeech restored from GitHub Releases" \
+                    || log "Reassembly failed"
+                rm -f /workspace/librispeech_*.tar.gz
+            fi
+        else
+            log "No cached dataset in GitHub Releases"
+        fi
+    fi
+
+    if [ "$RESTORED" = "false" ]; then
+        log "No cache found — torchaudio will download LibriSpeech (~6GB, ~5-10min)..."
+        # torchaudio downloads on first use during training — we trigger it here
+        python3 -u -c "
+import torchaudio
+print('Downloading train-clean-100...', flush=True)
+torchaudio.datasets.LIBRISPEECH('$DATA_DIR', url='train-clean-100', download=True)
+print('Downloading dev-clean...', flush=True)
+torchaudio.datasets.LIBRISPEECH('$DATA_DIR', url='dev-clean', download=True)
+print('Download complete.', flush=True)
+"
+        log "LibriSpeech downloaded. Caching for future pods..."
+
+        # Cache to S3
+        if [ "$USE_S3" = "true" ]; then
+            log "Uploading LibriSpeech to S3..."
+            tar -czf /workspace/librispeech.tar.gz -C $DATA_DIR LibriSpeech \
+                && aws s3 cp /workspace/librispeech.tar.gz "s3://${AWS_S3_BUCKET}/datasets/librispeech.tar.gz" --only-show-errors \
+                && rm /workspace/librispeech.tar.gz \
+                && log "Cached to S3" \
+                || log "Warning: S3 cache upload failed"
+        fi
+
+        # Cache to GitHub Releases (split into <1.9GB parts)
+        log "Packaging LibriSpeech for GitHub Releases..."
+        gh release view "datasets" --repo "$GH_REPO" >/dev/null 2>&1 \
+            || gh release create "datasets" --repo "$GH_REPO" \
+                --title "Training datasets" \
+                --notes "Cached LibriSpeech — downloaded once, reused by all pods" \
+                --prerelease || true
+        tar -czf /workspace/librispeech_full.tar.gz -C $DATA_DIR LibriSpeech \
+            && split -b 1900m /workspace/librispeech_full.tar.gz /workspace/librispeech_ \
+            && rm /workspace/librispeech_full.tar.gz || true
+        # Rename split parts with .tar.gz extension
+        for f in /workspace/librispeech_??; do
+            mv "$f" "${f}.tar.gz" 2>/dev/null || true
+        done
+        SPLIT_FILES=$(ls /workspace/librispeech_*.tar.gz 2>/dev/null)
+        if [ -n "$SPLIT_FILES" ]; then
+            gh release upload "datasets" $SPLIT_FILES --repo "$GH_REPO" --clobber \
+                && log "Cached $(echo "$SPLIT_FILES" | wc -w) parts to GitHub Releases" \
+                || log "Warning: GitHub Releases cache upload failed"
+            rm -f /workspace/librispeech_*.tar.gz
+        fi
+    fi
+fi
+
+FLAC_COUNT=$(find $DATA_DIR/LibriSpeech -name "*.flac" 2>/dev/null | head -100 | wc -l)
+log "LibriSpeech ready. FLAC sample count: $FLAC_COUNT"
 
 # ─────────────────────────────────────────────
 # 4. Create GitHub release upfront
