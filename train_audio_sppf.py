@@ -820,11 +820,43 @@ def train(args):
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
             ckpt_data["best_loss"] = best_loss
-            # Save EMA weights as best checkpoint
             ckpt_data_best = ckpt_data.copy()
             ckpt_data_best["model_state_dict"] = copy.deepcopy(ema_shadow)
             torch.save(ckpt_data_best, output_dir / "ckpt_best.pt")
             print(f"  -> New best model saved (val_loss={best_loss:.4f})")
+
+        # ── Metrics logging (append JSONL) ──
+        metrics_file = output_dir / "metrics.jsonl"
+        import json
+        metrics = {
+            "epoch": epoch + 1,
+            "train_loss": round(avg_train_loss, 6),
+            "val_loss": round(avg_val_loss, 6),
+            "val_snr": round(avg_val_snr, 2),
+            "best_loss": round(best_loss, 6),
+        }
+        if avg_pesq is not None:
+            metrics["pesq"] = round(avg_pesq, 2)
+        with open(metrics_file, "a") as f:
+            f.write(json.dumps(metrics) + "\n")
+
+        # ── Upload to GitHub every epoch (if GH_REPO and RELEASE_TAG are set) ──
+        gh_repo = os.environ.get("GH_REPO", "")
+        release_tag = os.environ.get("RELEASE_TAG", "")
+        if gh_repo and release_tag:
+            import subprocess
+            upload_files = [str(output_dir / "ckpt_latest.pt"), str(metrics_file)]
+            if (output_dir / "ckpt_best.pt").exists():
+                upload_files.append(str(output_dir / "ckpt_best.pt"))
+            try:
+                subprocess.run(
+                    ["gh", "release", "upload", release_tag] + upload_files +
+                    ["--repo", gh_repo, "--clobber"],
+                    capture_output=True, timeout=120
+                )
+                print(f"  -> Uploaded to GitHub release {release_tag}")
+            except Exception as e:
+                print(f"  -> GitHub upload failed: {e}")
 
     print("=" * 70)
     print(f"Training complete. Best val loss: {best_loss:.4f}")

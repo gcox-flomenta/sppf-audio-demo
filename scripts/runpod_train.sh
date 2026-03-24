@@ -17,15 +17,16 @@
 #   AWS_S3_BUCKET     e.g. my-sppf-training
 #   AWS_REGION        default: us-east-1
 
-set -e
+set +e  # Don't exit on errors — we need to see what went wrong
 trap 'log "ERROR at line $LINENO: $BASH_COMMAND"' ERR
+export PYTHONUNBUFFERED=1
 
 WORKSPACE=/workspace
 REPO_DIR=$WORKSPACE/repo
 DATA_DIR=$WORKSPACE/data
 OUTPUT_DIR=$WORKSPACE/outputs
 
-LATENT_DIM=${LATENT_DIM:-64}
+LATENT_DIM=${LATENT_DIM:-512}
 NUM_EPOCHS=${NUM_EPOCHS:-50}
 BATCH_SIZE=${BATCH_SIZE:-64}
 LR=${LR:-3e-4}
@@ -127,7 +128,8 @@ log "--- Step 4: GitHub release ---"
 echo "$GH_TOKEN" | gh auth login --with-token 2>/dev/null || true
 log "gh auth status: $(gh auth status 2>&1 | head -2 || echo 'auth check failed')"
 
-RELEASE_TAG="training-$(date '+%Y%m%d-%H%M')-dim${LATENT_DIM}"
+export RELEASE_TAG="training-$(date '+%Y%m%d-%H%M')-dim${LATENT_DIM}"
+export GH_REPO
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "unknown-gpu")
 log "GPU: $GPU_NAME"
 log "Release tag: $RELEASE_TAG"

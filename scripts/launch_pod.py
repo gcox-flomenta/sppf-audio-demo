@@ -18,7 +18,7 @@ if not gh_token:
         print("ERROR: No GH_TOKEN env var and 'gh auth token' failed. Set GH_TOKEN or run 'gh auth login'.")
         sys.exit(1)
 gh_repo    = os.environ["GH_REPO"]
-latent_dim = os.environ.get("LATENT_DIM", "64")
+latent_dim = os.environ.get("LATENT_DIM", "512")
 num_epochs = os.environ.get("NUM_EPOCHS", "50")
 batch_size = os.environ.get("BATCH_SIZE", "64")
 lr         = os.environ.get("LR", "3e-4")
