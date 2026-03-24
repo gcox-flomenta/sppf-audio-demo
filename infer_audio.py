@@ -37,55 +37,32 @@ except ImportError:
 # Golden Ratio Quantizer (inline from training)
 # ---------------------------------------------
 
-PHI = (1.0 + math.sqrt(5.0)) / 2.0
+class FSQQuantizer(nn.Module):
+    """Finite Scalar Quantization -- codebook-free, collapse-proof.
+    32 dims x 5 levels = 3.7 kbps at 50 fps."""
 
-
-def _golden_ratio_boundaries(n_bits: int = 8, max_scale: float = 1.0) -> torch.Tensor:
-    """Generate symmetric quantization boundaries with golden ratio width spacing."""
-    n_levels = 2 ** n_bits
-    n_positive = n_levels // 2 - 1
-
-    width_ratio = PHI ** (2.0 / max(n_positive, 1))
-
-    k = torch.arange(n_positive, dtype=torch.float64)
-    widths = torch.pow(torch.tensor(width_ratio), k)
-
-    positive = widths.cumsum(0)
-    positive = positive * (max_scale / positive[-1])
-
-    negative = -positive.flip(0)
-    boundaries = torch.cat([negative, torch.zeros(1, dtype=torch.float64), positive])
-    return boundaries.float()
-
-
-class GoldenRatioQuantizer(nn.Module):
-    """8-bit quantizer with phi-spaced bucket boundaries. STE for training."""
-
-    def __init__(self, n_bits: int = 8):
+    def __init__(self, latent_dim: int = 64, levels: list = None):
         super().__init__()
-        self.n_bits = n_bits
-        self.n_levels = 2 ** n_bits
+        if levels is None:
+            levels = [5] * 32
+        self.levels = levels
+        self.d_fsq = len(levels)
+        self.latent_dim = latent_dim
+        self.project_down = nn.Linear(latent_dim, self.d_fsq)
+        self.project_up = nn.Linear(self.d_fsq, latent_dim)
+        self.register_buffer("_levels_t", torch.tensor(levels, dtype=torch.float32))
+        self.bits_per_frame = sum(math.ceil(math.log2(lv)) for lv in levels)
 
-        boundaries = _golden_ratio_boundaries(n_bits, max_scale=1.0)
-        self.register_buffer("boundaries", boundaries)
+    def _bound(self, z):
+        half = (self._levels_t - 1) / 2
+        return (2.0 * torch.sigmoid(1.6 * z) - 1.0) * half
 
-        padded = torch.cat([
-            boundaries[:1] - (boundaries[1] - boundaries[0]),
-            boundaries,
-            boundaries[-1:] + (boundaries[-1] - boundaries[-2]),
-        ])
-        rep_values = 0.5 * (padded[:-1] + padded[1:])
-        self.register_buffer("rep_values", rep_values)
-
-    def forward(self, z: torch.Tensor):
-        scale = z.abs().amax().clamp(min=1e-8)
-        z_scaled = z / scale
-
-        indices = torch.bucketize(z_scaled.contiguous(), self.boundaries)
-        z_q_scaled = self.rep_values[indices.long()]
-
-        z_q_raw = z_q_scaled * scale
-        z_q = z + (z_q_raw - z).detach()
+    def forward(self, z):
+        z_low = self.project_down(z)
+        z_bounded = self._bound(z_low)
+        z_hat = torch.round(z_bounded)
+        z_hat_st = z_bounded + (z_hat - z_bounded).detach()
+        z_q = self.project_up(z_hat_st)
         return z_q, z
 
 
@@ -225,7 +202,7 @@ class SPPFAudioAutoencoder(nn.Module):
         super().__init__()
         self.encoder_part = Encoder1d(latent_dim)
         self.sppf_core = SPPFCore1d(latent_dim)
-        self.quantizer = GoldenRatioQuantizer(n_bits=8)
+        self.quantizer = FSQQuantizer(latent_dim=latent_dim)
         self.decoder_part = Decoder1d(latent_dim)
 
     def forward(self, x):
