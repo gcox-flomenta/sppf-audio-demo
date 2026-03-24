@@ -247,7 +247,7 @@ class Decoder(nn.Module):
         x = self.block3(x)      # [B, 64, 160]
         x = self.block4(x)      # [B, 32, 320]
         x = self.final(x)       # [B, 1, 320]
-        return x
+        return x.clamp(-1.0, 1.0)  # bound output to valid audio range
 
 
 # ─────────────────────────────────────────────
@@ -519,11 +519,14 @@ class LibriSpeechChunks(Dataset):
         # Normalize to [-1, 1]
         waveform = waveform / (waveform.abs().max() + 1e-5)
 
-        # Random crop
+        # Random crop — reject silent chunks (energy < 0.005)
         T = waveform.shape[1]
-        start = torch.randint(0, T - self.chunk_size + 1, (1,)).item()
-        chunk = waveform[:, start:start + self.chunk_size]  # [1, 320]
-        return chunk
+        for _ in range(10):  # retry up to 10 times
+            start = torch.randint(0, T - self.chunk_size + 1, (1,)).item()
+            chunk = waveform[:, start:start + self.chunk_size]  # [1, 320]
+            if chunk.pow(2).mean() > 0.005:
+                return chunk
+        return chunk  # fallback if all crops are silent
 
 
 # ─────────────────────────────────────────────
@@ -547,13 +550,15 @@ def ema_load(model, ema_shadow):
 # SNR computation
 # ─────────────────────────────────────────────
 
-def compute_snr(original, reconstructed):
-    """Compute signal-to-noise ratio in dB."""
+def compute_snr(original, reconstructed, energy_floor=0.005):
+    """Compute signal-to-noise ratio in dB. Skips silent chunks."""
     signal_power = (original ** 2).mean()
+    if signal_power < energy_floor:
+        return None  # silent chunk — meaningless SNR
     noise_power = ((original - reconstructed) ** 2).mean()
     if noise_power < 1e-12:
         return float('inf')
-    return 10 * math.log10(signal_power.item() / noise_power.item())
+    return 10 * math.log10(max(signal_power.item(), 1e-10) / noise_power.item())
 
 
 def compute_pesq_batch(original, reconstructed, sr=16000):
@@ -709,7 +714,7 @@ def train(args):
                     g_adv_loss = torch.tensor(0.0, device=device)
                     feat_loss = torch.tensor(0.0, device=device)
 
-                total_loss = (mse_loss + stft_loss + W_MEL * mel_loss
+                total_loss = (10.0 * mse_loss + stft_loss + W_MEL * mel_loss
                              + 0.1 * quant_loss
                              + W_GAN * g_adv_loss
                              + W_GAN * W_FEAT * feat_loss)
@@ -772,6 +777,7 @@ def train(args):
         model.eval()
         val_loss_sum = 0.0
         val_snr_sum = 0.0
+        val_snr_count = 0
         val_pesq_scores = []
         val_steps = 0
 
@@ -790,7 +796,10 @@ def train(args):
                 total_loss = mse_loss + stft_loss + 0.1 * quant_loss
 
                 val_loss_sum += total_loss.item()
-                val_snr_sum += compute_snr(chunks, recon)
+                snr_val = compute_snr(chunks, recon)
+                if snr_val is not None:
+                    val_snr_sum += snr_val
+                    val_snr_count += 1
 
                 # PESQ every 5 epochs
                 if (epoch + 1) % 5 == 0 and val_steps < 10:
@@ -801,7 +810,7 @@ def train(args):
                 val_steps += 1
 
         avg_val_loss = val_loss_sum / max(val_steps, 1)
-        avg_val_snr = val_snr_sum / max(val_steps, 1)
+        avg_val_snr = val_snr_sum / max(val_snr_count, 1)
         avg_pesq = sum(val_pesq_scores) / len(val_pesq_scores) if val_pesq_scores else None
 
         # Restore training weights
