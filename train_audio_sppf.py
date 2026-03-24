@@ -310,11 +310,11 @@ class MultiResolutionSTFTLoss(nn.Module):
             mag_target = self._stft(x_target, n_fft)
 
             # Spectral convergence: Frobenius norm of difference / Frobenius norm of target
-            sc = torch.norm(mag_target - mag_recon, p="fro") / (torch.norm(mag_target, p="fro") + 1e-8)
+            sc = torch.norm(mag_target - mag_recon, p="fro") / (torch.norm(mag_target, p="fro") + 1e-5)
 
             # Log magnitude L1
-            log_mag_recon = torch.log(mag_recon + 1e-8)
-            log_mag_target = torch.log(mag_target + 1e-8)
+            log_mag_recon = torch.log(mag_recon + 1e-5)
+            log_mag_target = torch.log(mag_target + 1e-5)
             lm = F.l1_loss(log_mag_recon, log_mag_target)
 
             total_loss = total_loss + sc + lm
@@ -370,8 +370,8 @@ class MelSpectrogramLoss(nn.Module):
         spec_r = torch.stft(x_r, self.n_fft, self.hop_length, window=win, return_complex=True).abs()
         spec_t = torch.stft(x_t, self.n_fft, self.hop_length, window=win, return_complex=True).abs()
 
-        mel_r = torch.log(torch.matmul(self.mel_basis.to(x_r.device), spec_r) + 1e-8)
-        mel_t = torch.log(torch.matmul(self.mel_basis.to(x_t.device), spec_t) + 1e-8)
+        mel_r = torch.log(torch.matmul(self.mel_basis.to(x_r.device), spec_r) + 1e-5)
+        mel_t = torch.log(torch.matmul(self.mel_basis.to(x_t.device), spec_t) + 1e-5)
 
         return F.l1_loss(mel_r, mel_t)
 
@@ -517,7 +517,7 @@ class LibriSpeechChunks(Dataset):
             waveform = torchaudio.functional.resample(waveform, sr, 16000)
 
         # Normalize to [-1, 1]
-        waveform = waveform / (waveform.abs().max() + 1e-8)
+        waveform = waveform / (waveform.abs().max() + 1e-5)
 
         # Random crop
         T = waveform.shape[1]
