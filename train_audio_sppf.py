@@ -488,7 +488,7 @@ class LibriSpeechChunks(Dataset):
     """
 
     def __init__(self, root, url="train-clean-100", download=True,
-                 chunk_size=320, crops_per_utterance=100):
+                 chunk_size=320, crops_per_utterance=20):
         self.dataset = torchaudio.datasets.LIBRISPEECH(
             root=root, url=url, download=download
         )
@@ -668,7 +668,12 @@ def train(args):
         best_loss = ckpt["best_loss"]
         print(f"  Resumed at epoch {start_epoch}, best_loss={best_loss:.6f}")
 
+    # ── Mixed precision for ~2x speed ──
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+    use_amp = device.type == 'cuda'
+
     # ── Training loop ──
+    import time as _time
     print(f"\nStarting training for {args.num_epochs} epochs...")
     print("=" * 70)
 
@@ -677,6 +682,7 @@ def train(args):
         disc.train()
         epoch_loss = 0.0
         n_steps = 0
+        epoch_start = _time.time()
 
         # GAN warmup ramp
         if epoch >= GAN_WARMUP_EPOCHS:
@@ -687,57 +693,62 @@ def train(args):
         for step, chunks in enumerate(train_loader):
             chunks = chunks.to(device)  # [B, 1, 320]
 
-            # ── Generator step ──
-            recon, z_cont, z_q = model(chunks)
+            # ── Generator step (mixed precision) ──
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                recon, z_cont, z_q = model(chunks)
+                mse_loss = F.mse_loss(recon, chunks)
+                stft_loss = stft_loss_fn(recon, chunks)
+                quant_loss = F.mse_loss(z_cont, z_q.detach())
+                mel_loss = mel_loss_fn(recon, chunks)
 
-            # MSE loss (time domain)
-            mse_loss = F.mse_loss(recon, chunks)
+                if W_GAN > 0:
+                    fake_outputs = disc(recon)
+                    g_adv_loss = gen_loss_fn(fake_outputs)
+                    feat_loss = feature_matching_loss(disc, chunks, recon)
+                else:
+                    g_adv_loss = torch.tensor(0.0, device=device)
+                    feat_loss = torch.tensor(0.0, device=device)
 
-            # Multi-resolution STFT loss (frequency domain)
-            stft_loss = stft_loss_fn(recon, chunks)
-
-            # Quantization commitment loss
-            quant_loss = F.mse_loss(z_cont, z_q.detach())
-
-            # Mel spectrogram loss (perceptually weighted)
-            mel_loss = mel_loss_fn(recon, chunks)
-
-            # GAN generator loss + feature matching
-            if W_GAN > 0:
-                fake_outputs = disc(recon)
-                g_adv_loss = gen_loss_fn(fake_outputs)
-                feat_loss = feature_matching_loss(disc, chunks, recon)
-            else:
-                g_adv_loss = torch.tensor(0.0, device=device)
-                feat_loss = torch.tensor(0.0, device=device)
-
-            total_loss = (mse_loss + stft_loss + W_MEL * mel_loss
-                         + 0.1 * quant_loss
-                         + W_GAN * g_adv_loss
-                         + W_GAN * W_FEAT * feat_loss)
+                total_loss = (mse_loss + stft_loss + W_MEL * mel_loss
+                             + 0.1 * quant_loss
+                             + W_GAN * g_adv_loss
+                             + W_GAN * W_FEAT * feat_loss)
 
             optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            if scaler:
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
-            # ── Discriminator step (every other step) ──
+            # ── Discriminator step (every other step, mixed precision) ──
             if W_GAN > 0 and step % 2 == 0:
-                with torch.no_grad():
-                    recon_d = model(chunks)[0]
-                real_outputs = disc(chunks)
-                fake_outputs = disc(recon_d.detach())
-                d_loss = disc_loss_fn(real_outputs, fake_outputs)
-
-                # R1 gradient penalty (every 16 steps to save compute)
-                if step % 16 == 0:
-                    r1_loss = r1_gradient_penalty(disc, chunks)
-                    d_loss = d_loss + W_R1 * r1_loss
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    with torch.no_grad():
+                        recon_d = model(chunks)[0]
+                    real_outputs = disc(chunks)
+                    fake_outputs = disc(recon_d.detach())
+                    d_loss = disc_loss_fn(real_outputs, fake_outputs)
+                    if step % 16 == 0:
+                        r1_loss = r1_gradient_penalty(disc, chunks)
+                        d_loss = d_loss + W_R1 * r1_loss
 
                 opt_disc.zero_grad()
-                d_loss.backward()
-                torch.nn.utils.clip_grad_norm_(disc.parameters(), 1.0)
-                opt_disc.step()
+                if scaler:
+                    scaler.scale(d_loss).backward()
+                    scaler.unscale_(opt_disc)
+                    torch.nn.utils.clip_grad_norm_(disc.parameters(), 1.0)
+                    scaler.step(opt_disc)
+                    scaler.update()
+                else:
+                    d_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(disc.parameters(), 1.0)
+                    opt_disc.step()
 
             ema_update(ema_shadow, model, decay=0.999)
 
@@ -781,8 +792,8 @@ def train(args):
                 val_loss_sum += total_loss.item()
                 val_snr_sum += compute_snr(chunks, recon)
 
-                # PESQ every 10 epochs (expensive, ~1 sample per batch)
-                if (epoch + 1) % 10 == 0 and val_steps < 10:
+                # PESQ every 5 epochs
+                if (epoch + 1) % 5 == 0 and val_steps < 10:
                     pesq_score = compute_pesq_batch(chunks[:4], recon[:4])
                     if pesq_score is not None:
                         val_pesq_scores.append(pesq_score)
@@ -796,12 +807,17 @@ def train(args):
         # Restore training weights
         model.load_state_dict(orig_state)
 
+        epoch_time = _time.time() - epoch_start
         pesq_str = f" PESQ={avg_pesq:.2f}" if avg_pesq is not None else ""
-        print(
-            f"Epoch {epoch+1}/{args.num_epochs} | "
-            f"train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f} "
-            f"val_SNR={avg_val_snr:.2f} dB{pesq_str}"
-        )
+        gan_status = f" GAN=ON(w={W_GAN:.3f})" if W_GAN > 0 else " GAN=OFF(warmup)"
+        eta_hours = epoch_time * (args.num_epochs - epoch - 1) / 3600
+
+        print("=" * 80)
+        print(f"  EPOCH {epoch+1}/{args.num_epochs} COMPLETE ({epoch_time:.0f}s, ETA: {eta_hours:.1f}h)")
+        print(f"  train_loss={avg_train_loss:.4f}  val_loss={avg_val_loss:.4f}  best={best_loss:.4f}")
+        print(f"  SNR={avg_val_snr:.2f} dB  (target: >10 dB){pesq_str}")
+        print(f"  bitrate=4.8 kbps  {gan_status}")
+        print("=" * 80)
 
         # ── Checkpointing ──
         ckpt_data = {
@@ -873,9 +889,9 @@ def main():
                         help="Directory for checkpoints and logs")
     parser.add_argument("--latent_dim", type=int, default=512,
                         help="Latent dimension size")
-    parser.add_argument("--num_epochs", type=int, default=200,
+    parser.add_argument("--num_epochs", type=int, default=100,
                         help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=64,
+    parser.add_argument("--batch_size", type=int, default=128,
                         help="Batch size")
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="Learning rate")
