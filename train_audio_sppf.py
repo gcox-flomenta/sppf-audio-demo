@@ -269,17 +269,23 @@ class Decoder(nn.Module):
 # ─────────────────────────────────────────────
 
 class SPPFAudioAutoencoder(nn.Module):
-    def __init__(self, latent_dim=512):
+    def __init__(self, latent_dim=512, use_fsq=False):
         super().__init__()
         self.encoder = Encoder(latent_dim)
-        self.quantizer = FSQQuantizer(latent_dim=latent_dim)
+        self.use_fsq = use_fsq
+        if use_fsq:
+            self.quantizer = FSQQuantizer(latent_dim=latent_dim)
         self.decoder = Decoder(latent_dim)
 
     def forward(self, x):
         z = self.encoder(x)             # [B, 512]
-        z_q, z_cont = self.quantizer(z) # quantized, continuous
-        recon = self.decoder(z_q)       # [B, 1, 320]
-        return recon, z_cont, z_q
+        if self.use_fsq:
+            z_q, z_cont = self.quantizer(z)
+            recon = self.decoder(z_q)
+            return recon, z_cont, z_q
+        else:
+            recon = self.decoder(z)     # direct — no quantization loss
+            return recon, z, z
 
 
 # ─────────────────────────────────────────────
@@ -945,15 +951,18 @@ if __name__ == "__main__":
         n_params = sum(p.numel() for p in model.parameters())
         n_enc = sum(p.numel() for p in model.encoder.parameters())
         n_dec = sum(p.numel() for p in model.decoder.parameters())
-        n_fsq = sum(p.numel() for p in model.quantizer.parameters())
+        n_fsq = sum(p.numel() for p in model.quantizer.parameters()) if model.use_fsq else 0
         print(f"Model OK: {n_params:,} total params")
         print(f"  Encoder:   {n_enc:,} params")
         print(f"  Decoder:   {n_dec:,} params")
-        print(f"  Quantizer: {n_fsq:,} params")
+        print(f"  Quantizer: {n_fsq:,} params {'(FSQ)' if model.use_fsq else '(disabled)'}")
         print(f"  Input:  {x.shape}")
         print(f"  Latent: {z_q.shape}")
         print(f"  Recon:  {recon.shape}")
-        print(f"  FSQ: {model.quantizer.bits_per_frame} bits/frame = "
-              f"{model.quantizer.bits_per_frame * 50 / 1000:.1f} kbps")
+        if model.use_fsq:
+            print(f"  FSQ: {model.quantizer.bits_per_frame} bits/frame = "
+                  f"{model.quantizer.bits_per_frame * 50 / 1000:.1f} kbps")
+        else:
+            print(f"  Mode: pure autoencoder (no quantization, add later for transmission)")
         sys.exit(0)
     main()
