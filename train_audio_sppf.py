@@ -613,11 +613,14 @@ def train(args):
     model = SPPFAudioAutoencoder(latent_dim=args.latent_dim).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
-    bits_per_frame = model.quantizer.bits_per_frame
     print(f"\nCompression stats:")
     print(f"  {args.latent_dim} floats x 4 bytes = {args.latent_dim * 4} bytes/frame (unquantized)")
-    print(f"  -> FSQ {model.quantizer.d_fsq} dims x {model.quantizer.levels[0]} levels = {bits_per_frame} bits/frame")
-    print(f"  -> 50 fps = {bits_per_frame * 50 / 1000:.1f} kbps")
+    if model.use_fsq:
+        bits_per_frame = model.quantizer.bits_per_frame
+        print(f"  -> FSQ {model.quantizer.d_fsq} dims x {model.quantizer.levels[0]} levels = {bits_per_frame} bits/frame")
+        print(f"  -> 50 fps = {bits_per_frame * 50 / 1000:.1f} kbps")
+    else:
+        print(f"  -> Pure autoencoder mode (no quantization, add later for transmission)")
 
     # ── Discriminator ──
     disc = MultiScaleDiscriminator().to(device)
