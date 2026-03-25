@@ -266,17 +266,23 @@ class Decoder(nn.Module):
 # ─────────────────────────────────────────────
 
 class SPPFAudioAutoencoder(nn.Module):
-    def __init__(self, latent_dim=512):
+    def __init__(self, latent_dim=512, use_fsq=False):
         super().__init__()
         self.encoder = Encoder(latent_dim)
-        self.quantizer = FSQQuantizer(latent_dim=latent_dim)
+        self.use_fsq = use_fsq
+        if use_fsq:
+            self.quantizer = FSQQuantizer(latent_dim=latent_dim)
         self.decoder = Decoder(latent_dim)
 
     def forward(self, x):
         z = self.encoder(x)             # [B, 512]
-        z_q, z_cont = self.quantizer(z) # quantized, continuous
-        recon = self.decoder(z_q)       # [B, 1, 320]
-        return recon, z_cont, z_q
+        if self.use_fsq:
+            z_q, z_cont = self.quantizer(z)
+            recon = self.decoder(z_q)
+            return recon, z_cont, z_q
+        else:
+            recon = self.decoder(z)
+            return recon, z, z
 
 
 # ---------------------------------------------
@@ -641,20 +647,13 @@ def run_inference(args):
 
     # -- Compression stats --
     raw_bytes_per_chunk = chunk_size * 2  # 16-bit PCM = 2 bytes/sample
-    compressed_bytes_per_chunk = latent_dim  # GRQ 8-bit = 1 byte per latent dim
     raw_bitrate = target_sr * 16 / 1000  # kbps (16-bit PCM)
-    compressed_bitrate = compressed_bytes_per_chunk * 50 * 8 / 1000  # 50 fps, 8 bits/byte
-    compression_ratio = raw_bytes_per_chunk / compressed_bytes_per_chunk
 
     print(f"\n{'=' * 65}")
     print(f"SPPF Audio Autoencoder — Inference Results")
     print(f"{'=' * 65}")
     print(f"Audio: {audio_path.name} ({duration:.1f}s, {target_sr} Hz, mono)")
     print(f"Chunks: {n_chunks} x {chunk_size} samples (20ms each)")
-    print(f"Compression: {raw_bytes_per_chunk} bytes/chunk -> "
-          f"{compressed_bytes_per_chunk} bytes/chunk "
-          f"(GRQ 8-bit) = {compression_ratio:.0f}x reduction")
-    print(f"Bitrate: {raw_bitrate:.0f} kbps -> {compressed_bitrate:.1f} kbps")
     print(f"SNR: {snr:.1f} dB  (median per-chunk: "
           f"{sorted(chunk_snrs)[len(chunk_snrs)//2]:.1f} dB)" if chunk_snrs else f"SNR: {snr:.1f} dB")
     print(f"MSE: {mse:.6f}")
@@ -679,15 +678,42 @@ def run_inference(args):
     for ft in frame_types:
         counts[ft] += 1
 
-    total_dese_bytes = 0
-    print(f"\n  Frame Distribution:")
+    # Z-diff analysis: how many dims actually change between frames?
+    diff_threshold = 0.01  # dims with abs diff < this are "unchanged"
+    total_zdiff_bytes = 0
+    total_grq_bytes = 0
+    zdiff_dims_per_frame = []
+
+    print(f"\n  Frame Distribution (z-diff + GRQ transmission):")
+    for i, ft in enumerate(frame_types):
+        pct_placeholder = 0  # computed below
+        if ft in [ONSET, ANCHOR]:
+            # Send full z-vector with GRQ 8-bit
+            frame_bytes = latent_dim  # 512 bytes
+            total_zdiff_bytes += frame_bytes
+            total_grq_bytes += frame_bytes
+        elif ft == CHANGE and i > 0:
+            # Z-diff: only send dims that changed
+            z_diff = (all_latents[i] - all_latents[i - 1]).abs()
+            changed_dims = (z_diff > diff_threshold).sum().item()
+            zdiff_dims_per_frame.append(changed_dims)
+            # Each changed dim: 2 bytes (1 byte index + 1 byte GRQ value)
+            frame_bytes = int(changed_dims * 2)
+            total_zdiff_bytes += frame_bytes
+            total_grq_bytes += latent_dim  # full GRQ for comparison
+        else:
+            frame_bytes = 0
+
     for ft in [SILENCE, STEADY, CHANGE, ONSET, ANCHOR]:
         pct = counts[ft] / n_chunks * 100 if n_chunks > 0 else 0
-        if TRANSMIT[ft]:
-            bytes_each = compressed_bytes_per_chunk
-            total_dese_bytes += counts[ft] * bytes_each
+        if ft == ONSET or ft == ANCHOR:
             print(f"    {FRAME_NAMES[ft]:>8s}: {pct:5.1f}%  ({counts[ft]:4d} frames, "
-                  f"{bytes_each} bytes each)  [{PRIORITY[ft]}]")
+                  f"{latent_dim} bytes each — full z)  [{PRIORITY[ft]}]")
+        elif ft == CHANGE:
+            avg_dims = sum(zdiff_dims_per_frame) / max(len(zdiff_dims_per_frame), 1)
+            avg_bytes = avg_dims * 2
+            print(f"    {FRAME_NAMES[ft]:>8s}: {pct:5.1f}%  ({counts[ft]:4d} frames, "
+                  f"~{avg_bytes:.0f} bytes avg — {avg_dims:.0f}/{latent_dim} dims changed)  [{PRIORITY[ft]}]")
         else:
             print(f"    {FRAME_NAMES[ft]:>8s}: {pct:5.1f}%  ({counts[ft]:4d} frames, "
                   f"0 bytes)          [{PRIORITY[ft]}]")
@@ -695,18 +721,21 @@ def run_inference(args):
     # Effective bitrate
     duration_trimmed = n_chunks * chunk_size / target_sr
     if duration_trimmed > 0:
-        effective_bitrate = total_dese_bytes * 8 / duration_trimmed / 1000
+        zdiff_bitrate = total_zdiff_bytes * 8 / duration_trimmed / 1000
+        grq_bitrate = total_grq_bytes * 8 / duration_trimmed / 1000
     else:
-        effective_bitrate = 0
+        zdiff_bitrate = grq_bitrate = 0
 
     transmitted = sum(counts[ft] for ft in [ONSET, CHANGE, ANCHOR])
     suppressed = sum(counts[ft] for ft in [SILENCE, STEADY])
     suppression_pct = suppressed / n_chunks * 100 if n_chunks > 0 else 0
 
     print(f"\n  Transmitted: {transmitted} frames  |  Suppressed: {suppressed} frames ({suppression_pct:.0f}%)")
-    print(f"  Effective bitrate: {effective_bitrate:.1f} kbps "
-          f"(vs {compressed_bitrate:.1f} kbps base, vs {raw_bitrate:.0f} kbps raw)")
-    print(f"  Total DESE bandwidth: {total_dese_bytes:,} bytes for {duration_trimmed:.1f}s of audio")
+    print(f"  Z-diff effective bitrate: {zdiff_bitrate:.1f} kbps")
+    print(f"  Full GRQ effective bitrate: {grq_bitrate:.1f} kbps (without z-diff)")
+    print(f"  Raw PCM bitrate: {raw_bitrate:.0f} kbps")
+    print(f"  Total z-diff bandwidth: {total_zdiff_bytes:,} bytes for {duration_trimmed:.1f}s of audio")
+    print(f"  Compression vs raw: {raw_bytes_per_chunk * n_chunks / max(total_zdiff_bytes, 1):.0f}x")
 
     print(f"\n{'=' * 65}")
     print(f"Done.")

@@ -183,15 +183,18 @@ class EncoderBlock(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, latent_dim=512):
         super().__init__()
+        self.latent_dim = latent_dim
         # Initial conv: [B, 1, 320] -> [B, 32, 320]
         self.initial = weight_norm(nn.Conv1d(1, 32, 7, padding=3))
 
         # Downsampling blocks
-        # Conv1d output: (L_in + 2*pad - kernel) / stride + 1
-        self.block1 = EncoderBlock(32, 64, stride=2, kernel_size=4, padding=1)     # (320+2-4)/2+1 = 160
-        self.block2 = EncoderBlock(64, 128, stride=4, kernel_size=8, padding=2)    # (160+4-8)/4+1 = 40
-        self.block3 = EncoderBlock(128, 256, stride=5, kernel_size=5, padding=0)   # (40+0-5)/5+1 = 8
-        self.block4 = EncoderBlock(256, 512, stride=8, kernel_size=8, padding=0)   # (8+0-8)/8+1 = 1
+        self.block1 = EncoderBlock(32, 64, stride=2, kernel_size=4, padding=1)     # 320 -> 160
+        self.block2 = EncoderBlock(64, 128, stride=4, kernel_size=8, padding=2)    # 160 -> 40
+        self.block3 = EncoderBlock(128, 256, stride=5, kernel_size=5, padding=0)   # 40 -> 8
+        self.block4 = EncoderBlock(256, 512, stride=8, kernel_size=8, padding=0)   # 8 -> 1
+
+        # Project to latent_dim if not 512
+        self.proj = nn.Linear(512, latent_dim) if latent_dim != 512 else nn.Identity()
 
     def forward(self, x):
         x = self.initial(x)     # [B, 32, 320]
@@ -199,7 +202,8 @@ class Encoder(nn.Module):
         x = self.block2(x)      # [B, 128, 40]
         x = self.block3(x)      # [B, 256, 8]
         x = self.block4(x)      # [B, 512, 1]
-        return x.squeeze(-1)    # [B, 512]
+        z = x.squeeze(-1)       # [B, 512]
+        return self.proj(z)     # [B, latent_dim]
 
 
 # ─────────────────────────────────────────────
@@ -238,23 +242,21 @@ class DecoderBlock(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, latent_dim=512):
         super().__init__()
+        # Project from latent_dim to 512 if needed
+        self.proj = nn.Linear(latent_dim, 512) if latent_dim != 512 else nn.Identity()
+
         # Upsampling blocks (mirror of encoder)
-        # ConvTranspose1d output: (L_in - 1) * stride - 2*padding + kernel + output_padding
-        # Block 1: stride 8, [B, 512, 1] -> [B, 256, 8]
-        self.block1 = DecoderBlock(512, 256, stride=8, kernel_size=8, padding=0)  # (1-1)*8-0+8=8
-        # Block 2: stride 5, [B, 256, 8] -> [B, 128, 40]
-        self.block2 = DecoderBlock(256, 128, stride=5, kernel_size=5, padding=0)  # (8-1)*5+5=40
-        # Block 3: stride 4, [B, 128, 40] -> [B, 64, 160]
-        self.block3 = DecoderBlock(128, 64, stride=4, kernel_size=8, padding=2)   # (40-1)*4-4+8=160
-        # Block 4: stride 2, [B, 64, 160] -> [B, 32, 320]
-        self.block4 = DecoderBlock(64, 32, stride=2, kernel_size=4, padding=1)    # (160-1)*2-2+4=320
+        self.block1 = DecoderBlock(512, 256, stride=8, kernel_size=8, padding=0)
+        self.block2 = DecoderBlock(256, 128, stride=5, kernel_size=5, padding=0)
+        self.block3 = DecoderBlock(128, 64, stride=4, kernel_size=8, padding=2)
+        self.block4 = DecoderBlock(64, 32, stride=2, kernel_size=4, padding=1)
 
         # Final conv: [B, 32, 320] -> [B, 1, 320] -- NO Tanh, linear output
         self.final = weight_norm(nn.Conv1d(32, 1, 7, padding=3))
 
     def forward(self, z):
-        # z: [B, 512] -> unsqueeze to [B, 512, 1]
-        x = z.unsqueeze(-1)     # [B, 512, 1]
+        # z: [B, latent_dim] -> project to 512 -> unsqueeze
+        x = self.proj(z).unsqueeze(-1)  # [B, 512, 1]
         x = self.block1(x)      # [B, 256, 8]
         x = self.block2(x)      # [B, 128, 40]
         x = self.block3(x)      # [B, 64, 160]
