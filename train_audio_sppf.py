@@ -67,13 +67,23 @@ class FSQQuantizer(nn.Module):
         self.d_fsq = len(levels)
         self.latent_dim = latent_dim
 
+        # Normalize encoder output before quantization (fixes scale mismatch)
+        self.pre_norm = nn.LayerNorm(latent_dim)
+
         # Project to/from FSQ space
         self.project_down = nn.Linear(latent_dim, self.d_fsq)
         self.project_up = nn.Linear(self.d_fsq, latent_dim)
 
+        # Learnable output scale — initialized to match encoder output magnitude
+        self.output_scale = nn.Parameter(torch.tensor(0.1))
+
         # Init project_down with larger std so iFSQ spans all levels
         nn.init.normal_(self.project_down.weight, std=2.0)
         nn.init.zeros_(self.project_down.bias)
+
+        # Init project_up smaller to prevent 13x amplification
+        nn.init.normal_(self.project_up.weight, std=0.02)
+        nn.init.zeros_(self.project_up.bias)
 
         # Register levels as buffer
         self.register_buffer("_levels_t", torch.tensor(levels, dtype=torch.float32))
@@ -94,8 +104,11 @@ class FSQQuantizer(nn.Module):
             z_q: quantized tensor projected back to latent_dim (STE)
             z: original continuous tensor (for commitment loss)
         """
+        # Normalize encoder output to unit variance (fixes 13x scale mismatch)
+        z_normed = self.pre_norm(z)
+
         # Project down to FSQ space
-        z_low = self.project_down(z)  # [B, d_fsq]
+        z_low = self.project_down(z_normed)  # [B, d_fsq]
 
         # Bound to quantization range
         z_bounded = self._bound(z_low)
@@ -106,8 +119,8 @@ class FSQQuantizer(nn.Module):
         # Straight-through estimator
         z_hat_st = z_bounded + (z_hat - z_bounded).detach()
 
-        # Project back to latent_dim
-        z_q = self.project_up(z_hat_st)  # [B, latent_dim]
+        # Project back to latent_dim with learned scale
+        z_q = self.project_up(z_hat_st) * self.output_scale  # [B, latent_dim]
 
         return z_q, z
 
@@ -689,6 +702,16 @@ def train(args):
         n_steps = 0
         epoch_start = _time.time()
 
+        # Spectral loss warmup: MSE-only for first 5 epochs to establish
+        # good waveform reconstruction, then add STFT/mel (avoids gradient conflict)
+        SPECTRAL_WARMUP = 5
+        if epoch < SPECTRAL_WARMUP:
+            W_STFT = 0.0
+            W_MEL_CUR = 0.0
+        else:
+            W_STFT = min(1.0, (epoch - SPECTRAL_WARMUP + 1) / 5)  # ramp over 5 epochs
+            W_MEL_CUR = W_MEL * W_STFT
+
         # GAN warmup ramp
         if epoch >= GAN_WARMUP_EPOCHS:
             W_GAN = min(W_GAN_TARGET, W_GAN_TARGET * (epoch - GAN_WARMUP_EPOCHS + 1) / 10)
@@ -714,7 +737,7 @@ def train(args):
                     g_adv_loss = torch.tensor(0.0, device=device)
                     feat_loss = torch.tensor(0.0, device=device)
 
-                total_loss = (10.0 * mse_loss + stft_loss + W_MEL * mel_loss
+                total_loss = (10.0 * mse_loss + W_STFT * stft_loss + W_MEL_CUR * mel_loss
                              + 0.1 * quant_loss
                              + W_GAN * g_adv_loss
                              + W_GAN * W_FEAT * feat_loss)
