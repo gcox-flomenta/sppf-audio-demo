@@ -2,7 +2,7 @@
 infer_audio.py -- SPPF Audio Autoencoder Inference Demo (self-contained)
 
 Loads a trained SPPF audio autoencoder checkpoint, runs audio through
-encode -> SPPF core -> quantize -> decode, saves original vs reconstructed
+encode -> quantize -> decode, saves original vs reconstructed
 WAV files, prints compression stats and DESE frame simulation.
 
 Usage:
@@ -18,6 +18,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import weight_norm
 
 try:
     import torchaudio
@@ -33,183 +34,248 @@ except ImportError:
     HAS_SOUNDFILE = False
 
 
-# ---------------------------------------------
-# Golden Ratio Quantizer (inline from training)
-# ---------------------------------------------
+# ─────────────────────────────────────────────
+# FSQ (Finite Scalar Quantization)
+# Each latent dimension independently rounds to fixed levels.
+# No codebook collapse, no dead codes, 97.6% utilization proven in SEM.
+# Straight-through estimator for end-to-end training.
+#
+# 32 dims x 5 levels = 5^32 possible codes (~10^22)
+# 32 x log2(5) = ~74 bits/frame = 3.7 kbps at 50 fps
+# With DESE suppression (85%): ~0.6 kbps effective
+# ─────────────────────────────────────────────
 
 class FSQQuantizer(nn.Module):
-    """Finite Scalar Quantization -- codebook-free, collapse-proof.
-    32 dims x 5 levels = 3.7 kbps at 50 fps."""
+    """
+    Finite Scalar Quantization -- codebook-free, collapse-proof.
 
-    def __init__(self, latent_dim: int = 64, levels: list = None):
+    Projects latent_dim down to d_fsq dimensions, rounds each to fixed
+    levels, projects back up. Uses iFSQ activation (2*sigmoid(1.6*z)-1)
+    for uniform bin utilization.
+
+    Default: 32 dims x 5 levels = 3.7 kbps at 50 fps.
+    """
+
+    def __init__(self, latent_dim: int = 512, levels: list = None):
         super().__init__()
         if levels is None:
-            levels = [5] * 32
+            levels = [5] * 64  # 64 dims, 5 levels each
         self.levels = levels
         self.d_fsq = len(levels)
         self.latent_dim = latent_dim
+
+        # Normalize encoder output before quantization (fixes scale mismatch)
+        self.pre_norm = nn.LayerNorm(latent_dim)
+
+        # Project to/from FSQ space
         self.project_down = nn.Linear(latent_dim, self.d_fsq)
         self.project_up = nn.Linear(self.d_fsq, latent_dim)
+
+        # Learnable output scale — initialized to match encoder output magnitude
+        self.output_scale = nn.Parameter(torch.tensor(0.1))
+
+        # Init project_down with larger std so iFSQ spans all levels
+        nn.init.normal_(self.project_down.weight, std=2.0)
+        nn.init.zeros_(self.project_down.bias)
+
+        # Init project_up smaller to prevent 13x amplification
+        nn.init.normal_(self.project_up.weight, std=0.02)
+        nn.init.zeros_(self.project_up.bias)
+
+        # Register levels as buffer
         self.register_buffer("_levels_t", torch.tensor(levels, dtype=torch.float32))
+
+        # Bits per frame for logging
         self.bits_per_frame = sum(math.ceil(math.log2(lv)) for lv in levels)
 
-    def _bound(self, z):
-        half = (self._levels_t - 1) / 2
+    def _bound(self, z: torch.Tensor) -> torch.Tensor:
+        """iFSQ activation: maps to near-uniform distribution across bins."""
+        half = (self._levels_t - 1) / 2  # [2.0, ...] for L=5
         return (2.0 * torch.sigmoid(1.6 * z) - 1.0) * half
 
-    def forward(self, z):
-        z_low = self.project_down(z)
+    def forward(self, z: torch.Tensor):
+        """
+        Quantize with straight-through estimator.
+
+        Returns:
+            z_q: quantized tensor projected back to latent_dim (STE)
+            z: original continuous tensor (for commitment loss)
+        """
+        # Normalize encoder output to unit variance (fixes 13x scale mismatch)
+        z_normed = self.pre_norm(z)
+
+        # Project down to FSQ space
+        z_low = self.project_down(z_normed)  # [B, d_fsq]
+
+        # Bound to quantization range
         z_bounded = self._bound(z_low)
+
+        # Round to nearest integer level
         z_hat = torch.round(z_bounded)
+
+        # Straight-through estimator
         z_hat_st = z_bounded + (z_hat - z_bounded).detach()
-        z_q = self.project_up(z_hat_st)
+
+        # Project back to latent_dim with learned scale
+        z_q = self.project_up(z_hat_st) * self.output_scale  # [B, latent_dim]
+
         return z_q, z
 
 
-# ---------------------------------------------
-# ResBlock1d
-# ---------------------------------------------
+# ─────────────────────────────────────────────
+# ResBlock1d — dilated residual block with weight norm
+# SoundStream-style: dilations [1, 3, 9] for exponentially growing receptive field
+# NO InstanceNorm — weight_norm only
+# ─────────────────────────────────────────────
 
 class ResBlock1d(nn.Module):
-    def __init__(self, channels):
+    """Dilated residual block with weight norm (NO InstanceNorm).
+    Dilations [1, 3, 9] give exponentially growing receptive field."""
+
+    def __init__(self, channels, dilation=1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(channels, channels, 3, padding=1),
-            nn.InstanceNorm1d(channels),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv1d(channels, channels, 3, padding=1),
-            nn.InstanceNorm1d(channels),
+        self.block = nn.Sequential(
+            nn.LeakyReLU(0.2),
+            weight_norm(nn.Conv1d(channels, channels, 3, padding=dilation, dilation=dilation)),
+            nn.LeakyReLU(0.2),
+            weight_norm(nn.Conv1d(channels, channels, 1)),
         )
-        self.act = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
-        return self.act(x + self.net(x))
+        return x + self.block(x)
 
 
-# ---------------------------------------------
-# Encoder1d: [B, 1, 320] -> [B, latent_dim]
-# ---------------------------------------------
+# ─────────────────────────────────────────────
+# EncoderBlock — 3 dilated ResBlocks + strided downsampling conv
+# ─────────────────────────────────────────────
 
-class Encoder1d(nn.Module):
-    def __init__(self, latent_dim=64):
+class EncoderBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride, kernel_size=None, padding=None):
         super().__init__()
-        self.stage1 = nn.Sequential(
-            nn.Conv1d(1, 32, 4, stride=2, padding=1),
-            nn.InstanceNorm1d(32),
-            nn.LeakyReLU(0.2, inplace=True),
-            ResBlock1d(32),
+        if kernel_size is None:
+            kernel_size = 2 * stride
+        if padding is None:
+            padding = stride // 2
+        self.res_blocks = nn.Sequential(
+            ResBlock1d(in_ch, dilation=1),
+            ResBlock1d(in_ch, dilation=3),
+            ResBlock1d(in_ch, dilation=9),
         )
-        self.stage2 = nn.Sequential(
-            nn.Conv1d(32, 64, 4, stride=2, padding=1),
-            nn.InstanceNorm1d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            ResBlock1d(64),
+        self.downsample = weight_norm(
+            nn.Conv1d(in_ch, out_ch, kernel_size, stride=stride, padding=padding)
         )
-        self.stage3 = nn.Sequential(
-            nn.Conv1d(64, 128, 4, stride=2, padding=1),
-            nn.InstanceNorm1d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            ResBlock1d(128),
-        )
-        self.stage4 = nn.Sequential(
-            nn.Conv1d(128, 64, 4, stride=2, padding=1),
-            nn.InstanceNorm1d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            ResBlock1d(64),
-        )
-        self.fc = nn.Linear(64 * 20, latent_dim)
 
     def forward(self, x):
-        x = self.stage1(x)   # [B, 32, 160]
-        x = self.stage2(x)   # [B, 64, 80]
-        x = self.stage3(x)   # [B, 128, 40]
-        x = self.stage4(x)   # [B, 64, 20]
-        return self.fc(x.flatten(1))  # [B, latent_dim]
-
-
-# ---------------------------------------------
-# SPPFCore1d — MLP
-# ---------------------------------------------
-
-class SPPFCore1d(nn.Module):
-    def __init__(self, latent_dim=64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.GELU(),
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.GELU(),
-            nn.Linear(latent_dim, latent_dim),
-        )
-
-    def forward(self, z):
-        return self.net(z)
-
-
-# ---------------------------------------------
-# Decoder1d: [B, latent_dim] -> [B, 1, 320]
-# ---------------------------------------------
-
-class Decoder1d(nn.Module):
-    def __init__(self, latent_dim=64):
-        super().__init__()
-        self.fc = nn.Linear(latent_dim, 64 * 20)
-
-        self.stage1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='nearest'),
-            nn.Conv1d(64, 128, 3, padding=1),
-            nn.InstanceNorm1d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            ResBlock1d(128),
-        )
-        self.stage2 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='nearest'),
-            nn.Conv1d(128, 64, 3, padding=1),
-            nn.InstanceNorm1d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            ResBlock1d(64),
-        )
-        self.stage3 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='nearest'),
-            nn.Conv1d(64, 32, 3, padding=1),
-            nn.InstanceNorm1d(32),
-            nn.LeakyReLU(0.2, inplace=True),
-            ResBlock1d(32),
-        )
-        self.stage4 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='nearest'),
-            nn.Conv1d(32, 1, 3, padding=1),
-            nn.Tanh(),
-        )
-
-    def forward(self, z):
-        x = self.fc(z).view(-1, 64, 20)  # [B, 64, 20]
-        x = self.stage1(x)   # [B, 128, 40]
-        x = self.stage2(x)   # [B, 64, 80]
-        x = self.stage3(x)   # [B, 32, 160]
-        x = self.stage4(x)   # [B, 1, 320]
+        x = self.res_blocks(x)
+        x = self.downsample(x)
         return x
 
 
-# ---------------------------------------------
-# Full Autoencoder
-# ---------------------------------------------
+# ─────────────────────────────────────────────
+# Encoder
+# Input: [B, 1, 320] -> Output: [B, 512]
+# Total stride: 2 * 4 * 5 * 8 = 320 (maps 320 samples to 1 vector)
+# ─────────────────────────────────────────────
 
-class SPPFAudioAutoencoder(nn.Module):
-    def __init__(self, latent_dim=64):
+class Encoder(nn.Module):
+    def __init__(self, latent_dim=512):
         super().__init__()
-        self.encoder_part = Encoder1d(latent_dim)
-        self.sppf_core = SPPFCore1d(latent_dim)
-        self.quantizer = FSQQuantizer(latent_dim=latent_dim)
-        self.decoder_part = Decoder1d(latent_dim)
+        # Initial conv: [B, 1, 320] -> [B, 32, 320]
+        self.initial = weight_norm(nn.Conv1d(1, 32, 7, padding=3))
+
+        # Downsampling blocks
+        # Conv1d output: (L_in + 2*pad - kernel) / stride + 1
+        self.block1 = EncoderBlock(32, 64, stride=2, kernel_size=4, padding=1)     # (320+2-4)/2+1 = 160
+        self.block2 = EncoderBlock(64, 128, stride=4, kernel_size=8, padding=2)    # (160+4-8)/4+1 = 40
+        self.block3 = EncoderBlock(128, 256, stride=5, kernel_size=5, padding=0)   # (40+0-5)/5+1 = 8
+        self.block4 = EncoderBlock(256, 512, stride=8, kernel_size=8, padding=0)   # (8+0-8)/8+1 = 1
 
     def forward(self, x):
-        z = self.encoder_part(x)          # [B, latent_dim]
-        z = self.sppf_core(z)             # [B, latent_dim]
-        z_q, z_cont = self.quantizer(z)   # quantized (STE), continuous
-        recon = self.decoder_part(z_q)    # [B, 1, 320]
+        x = self.initial(x)     # [B, 32, 320]
+        x = self.block1(x)      # [B, 64, 160]
+        x = self.block2(x)      # [B, 128, 40]
+        x = self.block3(x)      # [B, 256, 8]
+        x = self.block4(x)      # [B, 512, 1]
+        return x.squeeze(-1)    # [B, 512]
+
+
+# ─────────────────────────────────────────────
+# DecoderBlock — transposed conv upsampling + 3 dilated ResBlocks
+# ─────────────────────────────────────────────
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride, kernel_size=None, padding=0, output_padding=0):
+        super().__init__()
+        if kernel_size is None:
+            kernel_size = 2 * stride
+        self.upsample = weight_norm(
+            nn.ConvTranspose1d(
+                in_ch, out_ch, kernel_size, stride=stride,
+                padding=padding, output_padding=output_padding
+            )
+        )
+        self.res_blocks = nn.Sequential(
+            ResBlock1d(out_ch, dilation=1),
+            ResBlock1d(out_ch, dilation=3),
+            ResBlock1d(out_ch, dilation=9),
+        )
+
+    def forward(self, x):
+        x = self.upsample(x)
+        x = self.res_blocks(x)
+        return x
+
+
+# ─────────────────────────────────────────────
+# Decoder
+# Input: [B, 512] -> Output: [B, 1, 320]
+# Mirror of encoder with ConvTranspose1d upsampling
+# ─────────────────────────────────────────────
+
+class Decoder(nn.Module):
+    def __init__(self, latent_dim=512):
+        super().__init__()
+        # Upsampling blocks (mirror of encoder)
+        # ConvTranspose1d output: (L_in - 1) * stride - 2*padding + kernel + output_padding
+        # Block 1: stride 8, [B, 512, 1] -> [B, 256, 8]
+        self.block1 = DecoderBlock(512, 256, stride=8, kernel_size=8, padding=0)  # (1-1)*8-0+8=8
+        # Block 2: stride 5, [B, 256, 8] -> [B, 128, 40]
+        self.block2 = DecoderBlock(256, 128, stride=5, kernel_size=5, padding=0)  # (8-1)*5+5=40
+        # Block 3: stride 4, [B, 128, 40] -> [B, 64, 160]
+        self.block3 = DecoderBlock(128, 64, stride=4, kernel_size=8, padding=2)   # (40-1)*4-4+8=160
+        # Block 4: stride 2, [B, 64, 160] -> [B, 32, 320]
+        self.block4 = DecoderBlock(64, 32, stride=2, kernel_size=4, padding=1)    # (160-1)*2-2+4=320
+
+        # Final conv: [B, 32, 320] -> [B, 1, 320] -- NO Tanh, linear output
+        self.final = weight_norm(nn.Conv1d(32, 1, 7, padding=3))
+
+    def forward(self, z):
+        # z: [B, 512] -> unsqueeze to [B, 512, 1]
+        x = z.unsqueeze(-1)     # [B, 512, 1]
+        x = self.block1(x)      # [B, 256, 8]
+        x = self.block2(x)      # [B, 128, 40]
+        x = self.block3(x)      # [B, 64, 160]
+        x = self.block4(x)      # [B, 32, 320]
+        x = self.final(x)       # [B, 1, 320]
+        return x.clamp(-1.0, 1.0)  # bound output to valid audio range
+
+
+# ─────────────────────────────────────────────
+# Full Autoencoder
+# Encoder -> FSQ Quantizer -> Decoder (no SPPFCore)
+# ─────────────────────────────────────────────
+
+class SPPFAudioAutoencoder(nn.Module):
+    def __init__(self, latent_dim=512):
+        super().__init__()
+        self.encoder = Encoder(latent_dim)
+        self.quantizer = FSQQuantizer(latent_dim=latent_dim)
+        self.decoder = Decoder(latent_dim)
+
+    def forward(self, x):
+        z = self.encoder(x)             # [B, 512]
+        z_q, z_cont = self.quantizer(z) # quantized, continuous
+        recon = self.decoder(z_q)       # [B, 1, 320]
         return recon, z_cont, z_q
 
 
@@ -441,23 +507,35 @@ def load_model(ckpt_path: Path, device):
         sys.exit(1)
 
     # Auto-detect latent_dim from checkpoint
-    latent_dim = ckpt.get("latent_dim", 64)
-    print(f"  Architecture: SPPFAudioAutoencoder  |  latent_dim={latent_dim}")
+    latent_dim = ckpt.get("latent_dim", 512)
+    print(f"  Architecture: SPPFAudioAutoencoder (v3)  |  latent_dim={latent_dim}")
 
     model = SPPFAudioAutoencoder(latent_dim=latent_dim).to(device)
 
+    # Try EMA weights first, then standard model weights
+    state_dict = None
+    weight_source = None
+
+    if "ema_shadow" in ckpt:
+        state_dict = {k: v.to(device) for k, v in ckpt["ema_shadow"].items()}
+        weight_source = "EMA"
+    elif "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+        weight_source = "standard"
+    else:
+        print("ERROR: checkpoint contains neither 'ema_shadow' nor 'model_state_dict'")
+        sys.exit(1)
+
     try:
-        if "ema_shadow" in ckpt:
-            model.load_state_dict(
-                {k: v.to(device) for k, v in ckpt["ema_shadow"].items()}
-            )
-            print("  Weights: EMA")
-        else:
+        model.load_state_dict(state_dict)
+        print(f"  Weights: {weight_source}")
+    except RuntimeError as e:
+        if weight_source == "EMA" and "model_state_dict" in ckpt:
+            print(f"  EMA load failed ({e}), trying standard weights...")
             model.load_state_dict(ckpt["model_state_dict"])
-            print("  Weights: standard")
-    except Exception as e:
-        print(f"  EMA load failed ({e}), using standard weights")
-        model.load_state_dict(ckpt["model_state_dict"])
+            print("  Weights: standard (fallback)")
+        else:
+            raise
 
     model.eval()
     return model, latent_dim

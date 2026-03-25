@@ -62,7 +62,7 @@ class FSQQuantizer(nn.Module):
     def __init__(self, latent_dim: int = 512, levels: list = None):
         super().__init__()
         if levels is None:
-            levels = [5] * 32  # 32 dims, 5 levels each
+            levels = [5] * 64  # 64 dims, 5 levels each (matches Lyra's 64-dim)
         self.levels = levels
         self.d_fsq = len(levels)
         self.latent_dim = latent_dim
