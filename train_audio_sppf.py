@@ -702,15 +702,11 @@ def train(args):
         n_steps = 0
         epoch_start = _time.time()
 
-        # Spectral loss warmup: MSE-only for first 5 epochs to establish
-        # good waveform reconstruction, then add STFT/mel (avoids gradient conflict)
-        SPECTRAL_WARMUP = 5
-        if epoch < SPECTRAL_WARMUP:
-            W_STFT = 0.0
-            W_MEL_CUR = 0.0
-        else:
-            W_STFT = min(1.0, (epoch - SPECTRAL_WARMUP + 1) / 5)  # ramp over 5 epochs
-            W_MEL_CUR = W_MEL * W_STFT
+        # Spectral losses DISABLED — they have opposite gradients to MSE
+        # on the decoder output layer (cosine_sim=-0.175), causing SNR to drop.
+        # GAN discriminator handles perceptual quality instead.
+        W_STFT = 0.0
+        W_MEL_CUR = 0.0
 
         # GAN warmup ramp
         if epoch >= GAN_WARMUP_EPOCHS:
