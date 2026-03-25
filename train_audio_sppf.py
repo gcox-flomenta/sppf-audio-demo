@@ -733,7 +733,7 @@ def train(args):
                     g_adv_loss = torch.tensor(0.0, device=device)
                     feat_loss = torch.tensor(0.0, device=device)
 
-                total_loss = (10.0 * mse_loss + W_STFT * stft_loss + W_MEL_CUR * mel_loss
+                total_loss = (50.0 * mse_loss + W_STFT * stft_loss + W_MEL_CUR * mel_loss
                              + 0.1 * quant_loss
                              + W_GAN * g_adv_loss
                              + W_GAN * W_FEAT * feat_loss)
