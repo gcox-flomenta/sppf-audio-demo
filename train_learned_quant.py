@@ -78,7 +78,7 @@ def main():
 
     # Encode training data
     print("Loading LibriSpeech train-clean-100...")
-    dataset = LibriSpeechChunks(root=args.data_dir, url="train-clean-100", download=True, crops_per_utterance=5)
+    dataset = LibriSpeechChunks(root=args.data_dir, url="train-clean-100", download=True, crops_per_utterance=20)
     loader = DataLoader(dataset, batch_size=256, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
 
     print("Loading LibriSpeech dev-clean...")
@@ -102,7 +102,8 @@ def main():
 
     results = {}
 
-    for bottleneck in [16, 32, 48, 64, 96]:
+    bottleneck_sizes = [int(x) for x in os.environ.get("BOTTLENECKS", "32,64").split(",")]
+    for bottleneck in bottleneck_sizes:
         bytes_per_frame = bottleneck
         kbps = bytes_per_frame * 50 * 8 / 1000
 
