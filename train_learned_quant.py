@@ -146,6 +146,45 @@ def main():
 
             if step % 500 == 0:
                 print(f"  step {step}/{args.steps}: z_loss={z_loss.item():.6f} audio_loss={audio_loss.item():.6f}")
+
+            # Periodic SNR + PESQ evaluation every 5000 steps
+            if step % 5000 == 0 and step > 0:
+                lq.eval()
+                with torch.no_grad():
+                    vz_recon, _ = lq(val_z)
+                    _snr_sum, _snr_n = 0, 0
+                    for _i in range(0, min(len(val_z), 1280), 64):
+                        _orig = model.decoder(val_z[_i:_i+64])
+                        _recon = model.decoder(vz_recon[_i:_i+64])
+                        for _j in range(_orig.shape[0]):
+                            _s = compute_snr(_orig[_j], _recon[_j])
+                            if _s is not None:
+                                _snr_sum += _s
+                                _snr_n += 1
+                    _avg_snr = _snr_sum / max(_snr_n, 1)
+
+                # Try PESQ
+                _pesq_str = ""
+                try:
+                    from pesq import pesq as pesq_fn
+                    import numpy as np
+                    with torch.no_grad():
+                        _po = model.decoder(val_z[:16]).squeeze(1).cpu().numpy()
+                        _pr = model.decoder(vz_recon[:16]).squeeze(1).cpu().numpy()
+                    _scores = []
+                    for _k in range(min(16, len(_po))):
+                        try:
+                            _scores.append(pesq_fn(16000, _po[_k], _pr[_k], 'wb'))
+                        except:
+                            pass
+                    if _scores:
+                        _pesq_str = f" PESQ={sum(_scores)/len(_scores):.2f}"
+                except:
+                    pass
+
+                print(f"  ** step {step}: SNR={_avg_snr:.1f} dB{_pesq_str} **")
+                lq.train()
+
             step += 1
 
         # Evaluate
