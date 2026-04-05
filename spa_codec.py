@@ -52,11 +52,17 @@ SPA_VERSION = 1
 COMPRESSION_RAW = 0
 COMPRESSION_GRQ8 = 1
 COMPRESSION_GRQ4 = 2
+COMPRESSION_TQ3 = 3
+COMPRESSION_TQ4 = 4
+COMPRESSION_TQ6 = 5
 
 COMPRESSION_NAMES = {
     COMPRESSION_RAW: "raw",
     COMPRESSION_GRQ8: "grq8",
     COMPRESSION_GRQ4: "grq4",
+    COMPRESSION_TQ3: "tq3",
+    COMPRESSION_TQ4: "tq4",
+    COMPRESSION_TQ6: "tq6",
 }
 
 COMPRESSION_FROM_NAME = {v: k for k, v in COMPRESSION_NAMES.items()}
@@ -362,6 +368,80 @@ def grq_decode(q: torch.Tensor, scale: torch.Tensor, n_bits: int):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TurboQuant compression (Google, ICLR 2026)
+# Random rotation + Lloyd-Max scalar quantization per coordinate.
+# Near-optimal distortion at extreme compression. No training needed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _TurboQuantCodec:
+    """TurboQuant: random rotation + Lloyd-Max quantization."""
+
+    _instances = {}  # cache by (dim, bits)
+
+    @classmethod
+    def get(cls, dim, n_bits, seed=42):
+        key = (dim, n_bits)
+        if key not in cls._instances:
+            cls._instances[key] = cls(dim, n_bits, seed)
+        return cls._instances[key]
+
+    def __init__(self, dim, n_bits, seed=42):
+        self.dim = dim
+        self.n_bits = n_bits
+        rng = __import__('numpy').random.RandomState(seed)
+        import numpy as np
+        G = rng.randn(dim, dim).astype(np.float32)
+        Q, R = np.linalg.qr(G)
+        Q = Q * np.sign(np.diag(R))
+        self.rotation = torch.from_numpy(Q)
+        self.rotation_t = self.rotation.T.contiguous()
+        self.centroids, self.boundaries = self._lloyd_max(n_bits)
+
+    def _lloyd_max(self, n_bits, n_iter=100):
+        n_levels = 2 ** n_bits
+        centroids = torch.linspace(-3, 3, n_levels)
+        samples = torch.randn(100000)
+        for _ in range(n_iter):
+            boundaries = (centroids[:-1] + centroids[1:]) / 2
+            full_b = torch.cat([torch.tensor([-1e9]), boundaries, torch.tensor([1e9])])
+            new_c = torch.zeros_like(centroids)
+            for i in range(n_levels):
+                mask = (samples >= full_b[i]) & (samples < full_b[i + 1])
+                new_c[i] = samples[mask].mean() if mask.sum() > 0 else centroids[i]
+            centroids = new_c
+        return centroids, (centroids[:-1] + centroids[1:]) / 2
+
+    def encode(self, z):
+        """z: [N, dim] -> indices [N, dim] uint8, scale [N] float32."""
+        scale = z.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        z_norm = z / scale
+        z_rot = z_norm @ self.rotation.to(z.device).T
+        z_scaled = z_rot * math.sqrt(self.dim)
+        indices = torch.bucketize(z_scaled, self.boundaries.to(z.device)).to(torch.uint8)
+        return indices, scale.squeeze(-1)
+
+    def decode(self, indices, scale):
+        """indices [N, dim] uint8, scale [N] -> z [N, dim] float32."""
+        z_scaled = self.centroids.to(indices.device)[indices.long()]
+        z_rot = z_scaled / math.sqrt(self.dim)
+        z_norm = z_rot @ self.rotation_t.to(indices.device).T
+        return z_norm * scale.unsqueeze(-1)
+
+
+def tq_encode(z, n_bits):
+    """TurboQuant encode: [N, dim] float -> (indices [N, dim] uint8, scale [N, 1] float)."""
+    tq = _TurboQuantCodec.get(z.shape[1], n_bits)
+    indices, scale = tq.encode(z)
+    return indices, scale.unsqueeze(-1)
+
+
+def tq_decode(indices, scale, n_bits, dim):
+    """TurboQuant decode: indices + scale -> [N, dim] float."""
+    tq = _TurboQuantCodec.get(dim, n_bits)
+    return tq.decode(indices, scale.squeeze(-1))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # .spa Header
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -444,6 +524,11 @@ class SPAStats:
 # Frame serialization helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _tq_bits(compression: int) -> int:
+    """Get TurboQuant bit width from compression mode."""
+    return {COMPRESSION_TQ3: 3, COMPRESSION_TQ4: 4, COMPRESSION_TQ6: 6}.get(compression, 0)
+
+
 def _frame_size_bytes(latent_dim: int, compression: int) -> int:
     """Bytes per frame for a given compression mode."""
     if compression == COMPRESSION_RAW:
@@ -452,6 +537,8 @@ def _frame_size_bytes(latent_dim: int, compression: int) -> int:
         return latent_dim + 4  # uint8 per dim + float32 scale
     elif compression == COMPRESSION_GRQ4:
         return (latent_dim // 2) + 4  # packed nibbles + float32 scale
+    elif compression in (COMPRESSION_TQ3, COMPRESSION_TQ4, COMPRESSION_TQ6):
+        return latent_dim + 4  # uint8 per index + float32 scale
     else:
         raise ValueError(f"Unknown compression: {compression}")
 
@@ -539,6 +626,37 @@ def _deserialize_frames_grq4(data: bytes, num_frames: int, latent_dim: int) -> t
         q_signed = q_shifted.to(torch.int8)
         scale = torch.tensor([[scale_val]])
         z_frame = grq_decode(q_signed.unsqueeze(0), scale, n_bits=4)
+        z_list.append(z_frame)
+    return torch.cat(z_list, dim=0)
+
+
+def _serialize_frames_tq(z: torch.Tensor, compression: int) -> bytes:
+    """Serialize z-vectors with TurboQuant (uint8 indices + float32 scale). z: [N, D]"""
+    n_bits = _tq_bits(compression)
+    indices, scale = tq_encode(z, n_bits)  # indices [N, D] uint8, scale [N, 1]
+    buf = bytearray()
+    for i in range(z.shape[0]):
+        # Scale as float32 (4 bytes)
+        buf.extend(struct.pack("<f", scale[i, 0].item()))
+        # Indices as uint8 (latent_dim bytes)
+        buf.extend(indices[i].numpy().tobytes())
+    return bytes(buf)
+
+
+def _deserialize_frames_tq(data: bytes, num_frames: int, latent_dim: int,
+                           compression: int) -> torch.Tensor:
+    """Deserialize TurboQuant frames back to float32 z-vectors."""
+    import numpy as np
+    n_bits = _tq_bits(compression)
+    frame_bytes = latent_dim + 4
+    z_list = []
+    for i in range(num_frames):
+        offset = i * frame_bytes
+        scale_val = struct.unpack("<f", data[offset:offset + 4])[0]
+        idx_arr = np.frombuffer(data[offset + 4:offset + 4 + latent_dim], dtype=np.uint8)
+        indices = torch.from_numpy(idx_arr.copy()).unsqueeze(0)  # [1, D]
+        scale = torch.tensor([[scale_val]])  # [1, 1]
+        z_frame = tq_decode(indices, scale, n_bits, latent_dim)
         z_list.append(z_frame)
     return torch.cat(z_list, dim=0)
 
@@ -672,6 +790,8 @@ class SPAEncoder:
             frame_data = _serialize_frames_grq8(z_all)
         elif self.compression == COMPRESSION_GRQ4:
             frame_data = _serialize_frames_grq4(z_all)
+        elif self.compression in (COMPRESSION_TQ3, COMPRESSION_TQ4, COMPRESSION_TQ6):
+            frame_data = _serialize_frames_tq(z_all, self.compression)
         else:
             raise ValueError(f"Unknown compression: {self.compression}")
 
@@ -728,6 +848,8 @@ class SPAEncoder:
             return _serialize_frames_grq8(z)
         elif self.compression == COMPRESSION_GRQ4:
             return _serialize_frames_grq4(z)
+        elif self.compression in (COMPRESSION_TQ3, COMPRESSION_TQ4, COMPRESSION_TQ6):
+            return _serialize_frames_tq(z, self.compression)
         else:
             raise ValueError(f"Unknown compression: {self.compression}")
 
@@ -782,6 +904,8 @@ class SPADecoder:
             z_all = _deserialize_frames_grq8(frame_data, num_frames, latent_dim)
         elif compression == COMPRESSION_GRQ4:
             z_all = _deserialize_frames_grq4(frame_data, num_frames, latent_dim)
+        elif compression in (COMPRESSION_TQ3, COMPRESSION_TQ4, COMPRESSION_TQ6):
+            z_all = _deserialize_frames_tq(frame_data, num_frames, latent_dim, compression)
         else:
             raise ValueError(f"Unknown compression type: {compression}")
 
@@ -845,6 +969,8 @@ class SPADecoder:
             z = _deserialize_frames_grq8(compressed_bytes, num_frames, latent_dim)
         elif compression == COMPRESSION_GRQ4:
             z = _deserialize_frames_grq4(compressed_bytes, num_frames, latent_dim)
+        elif compression in (COMPRESSION_TQ3, COMPRESSION_TQ4, COMPRESSION_TQ6):
+            z = _deserialize_frames_tq(compressed_bytes, num_frames, latent_dim, compression)
         else:
             raise ValueError(f"Unknown compression: {compression}")
 
@@ -926,8 +1052,8 @@ def main():
     enc.add_argument("output", help="Output .spa file")
     enc.add_argument("--checkpoint", required=True, help="Path to model checkpoint (.pt)")
     enc.add_argument("--latent-dim", type=int, default=128, help="Latent dimension (default: 128)")
-    enc.add_argument("--compression", choices=["raw", "grq8", "grq4"], default="grq8",
-                     help="Compression mode (default: grq8)")
+    enc.add_argument("--compression", choices=["raw", "grq8", "grq4", "tq3", "tq4", "tq6"],
+                     default="grq8", help="Compression mode (default: grq8)")
     enc.add_argument("--device", default="cpu", help="Device (cpu or cuda)")
     enc.add_argument("--batch-size", type=int, default=256, help="Batch size for encoding")
 
